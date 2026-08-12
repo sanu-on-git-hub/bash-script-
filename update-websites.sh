@@ -1,30 +1,28 @@
 #!/bin/bash
 
 # ================================================================
-#              APACHE MULTI-SITE DEPLOYMENT SCRIPT
+#       APACHE AUTOMATIC MULTI-SITE WEBSITE DEPLOYMENT
 # ================================================================
 #
-# Purpose:
-#   Deploy the latest HTML/application code from a fixed location
-#   to multiple Apache websites.
+# Automatically detects Apache VirtualHosts and their DocumentRoots.
 #
-# Fixed upload location:
-#   /opt/website-update/
+# Deployment source:
+#       /opt/website-update/
 #
-# Deployment process:
-#   1. Validate environment
-#   2. Check all website services
-#   3. Check new code
-#   4. Create backup
-#   5. Stop all websites
-#   6. Verify websites are stopped
-#   7. Remove old website code
-#   8. Copy new code to all websites
-#   9. Set permissions
-#  10. Test Apache configuration
-#  11. Start all websites
-#  12. Verify final status
-#  13. Rollback automatically if deployment fails
+# Apache configuration:
+#       /etc/apache2/sites-enabled/
+#
+# Backup:
+#       /var/backups/apache-websites/
+#
+# Log:
+#       /var/log/apache-website-deployment.log
+#
+# Usage:
+#       sudo ./apache-deploy.sh
+#
+# Dry run:
+#       sudo ./apache-deploy.sh --dry-run
 #
 # ================================================================
 
@@ -33,46 +31,29 @@
 # CONFIGURATION
 # ================================================================
 
-# ------------------------------------------------
-# Fixed location where new website code is uploaded
-# ------------------------------------------------
-
 SOURCE_DIR="/opt/website-update"
-
-
-# ------------------------------------------------
-# Backup location
-# ------------------------------------------------
 
 BACKUP_BASE="/var/backups/apache-websites"
 
-
-# ------------------------------------------------
-# Deployment log
-# ------------------------------------------------
-
 LOG_FILE="/var/log/apache-website-deployment.log"
 
+LOCK_FILE="/var/run/apache-website-deployment.lock"
 
-# ------------------------------------------------
-# Website configuration
-#
-# FORMAT:
-#
-# "SERVICE_NAME|WEB_ROOT"
-#
-# Example:
-#
-# "iciccrm|/var/www/iciccrm"
-#
-# ------------------------------------------------
+APACHE_SERVICE="apache2"
 
-SITES=(
-    "iciccrm|/var/www/iciccrm"
-    "website01|/var/www/website01"
-    "website02|/var/www/website02"
-    "website03|/var/www/website03"
-)
+APACHE_CONFIG_DIR="/etc/apache2/sites-enabled"
+
+# Number of old backups to keep
+BACKUPS_TO_KEEP=10
+
+# Automatically rollback if deployment fails
+ROLLBACK_ENABLED=true
+
+# Show detected websites before deployment
+SHOW_DETECTED_SITES=true
+
+# Default mode
+DRY_RUN=false
 
 
 # ================================================================
@@ -88,7 +69,7 @@ NC='\033[0m'
 
 
 # ================================================================
-# LOG FUNCTIONS
+# FUNCTIONS
 # ================================================================
 
 log()
@@ -131,8 +112,8 @@ error()
 
 if [ "$EUID" -ne 0 ]; then
 
-    error "This script must be executed as root."
-
+    echo
+    echo -e "${RED}[ERROR]${NC} Script must be executed as root."
     echo
     echo "Use:"
     echo
@@ -145,7 +126,70 @@ fi
 
 
 # ================================================================
-# INITIAL SETUP
+# ARGUMENT CHECK
+# ================================================================
+
+if [ "$1" = "--dry-run" ]; then
+
+    DRY_RUN=true
+
+fi
+
+
+# ================================================================
+# REQUIRED COMMAND CHECK
+# ================================================================
+
+REQUIRED_COMMANDS=(
+    systemctl
+    find
+    cp
+    mv
+    sort
+    awk
+    grep
+    sed
+    date
+)
+
+
+for CMD in "${REQUIRED_COMMANDS[@]}"
+do
+
+    if ! command -v "$CMD" >/dev/null 2>&1; then
+
+        error "Required command not found: $CMD"
+
+        exit 1
+
+    fi
+
+done
+
+
+# ================================================================
+# APACHE COMMAND DETECTION
+# ================================================================
+
+if command -v apache2ctl >/dev/null 2>&1; then
+
+    APACHECTL="apache2ctl"
+
+elif command -v apachectl >/dev/null 2>&1; then
+
+    APACHECTL="apachectl"
+
+else
+
+    error "Apache control command not found."
+
+    exit 1
+
+fi
+
+
+# ================================================================
+# CREATE REQUIRED DIRECTORIES
 # ================================================================
 
 mkdir -p "$BACKUP_BASE"
@@ -154,14 +198,35 @@ touch "$LOG_FILE"
 
 
 # ================================================================
-# DEPLOYMENT VARIABLES
+# DEPLOYMENT ID
 # ================================================================
 
-TIMESTAMP=$(date '+%Y%m%d_%H%M%S')
+DEPLOYMENT_ID=$(date '+%Y%m%d_%H%M%S')
 
-BACKUP_DIR="$BACKUP_BASE/deployment_$TIMESTAMP"
+BACKUP_DIR="$BACKUP_BASE/deployment_$DEPLOYMENT_ID"
 
-mkdir -p "$BACKUP_DIR"
+
+# ================================================================
+# LOCK
+# ================================================================
+
+if [ -e "$LOCK_FILE" ]; then
+
+    error "Another deployment appears to be running."
+
+    echo
+    echo "Lock file:"
+    echo "$LOCK_FILE"
+    echo
+
+    exit 1
+
+fi
+
+
+trap 'rm -f "$LOCK_FILE"' EXIT
+
+touch "$LOCK_FILE"
 
 
 # ================================================================
@@ -172,20 +237,33 @@ clear
 
 echo
 echo "================================================================"
-echo "             APACHE MULTI-SITE DEPLOYMENT"
+echo "        APACHE AUTOMATIC MULTI-SITE DEPLOYMENT"
 echo "================================================================"
 echo
-echo "Deployment Time : $(date)"
-echo "Source          : $SOURCE_DIR"
-echo "Backup          : $BACKUP_DIR"
-echo "Log             : $LOG_FILE"
+echo "Deployment ID : $DEPLOYMENT_ID"
+echo "Source        : $SOURCE_DIR"
+echo "Apache        : $APACHE_SERVICE"
+echo "Backup        : $BACKUP_DIR"
+echo "Log           : $LOG_FILE"
+echo
+
+if [ "$DRY_RUN" = true ]; then
+
+    echo -e "${YELLOW}MODE           : DRY RUN${NC}"
+
+else
+
+    echo "MODE           : LIVE DEPLOYMENT"
+
+fi
+
 echo
 echo "================================================================"
 echo
 
 
 # ================================================================
-# CHECK SOURCE DIRECTORY
+# SOURCE DIRECTORY CHECK
 # ================================================================
 
 info "Checking deployment source..."
@@ -201,16 +279,17 @@ if [ ! -d "$SOURCE_DIR" ]; then
 fi
 
 
-# ------------------------------------------------
-# Make sure source directory is not empty
-# ------------------------------------------------
+# ================================================================
+# SOURCE EMPTY CHECK
+# ================================================================
 
 if [ -z "$(find "$SOURCE_DIR" -mindepth 1 -maxdepth 1 -print -quit)" ]; then
 
     error "Source directory is EMPTY."
 
     echo
-    echo "Please upload the new website code to:"
+    echo "Upload the new website code into:"
+    echo
     echo "$SOURCE_DIR"
     echo
 
@@ -219,7 +298,7 @@ if [ -z "$(find "$SOURCE_DIR" -mindepth 1 -maxdepth 1 -print -quit)" ]; then
 fi
 
 
-success "Deployment source is valid."
+success "Deployment source is available."
 
 
 # ================================================================
@@ -228,114 +307,307 @@ success "Deployment source is valid."
 
 echo
 echo "----------------------------------------------------------------"
-echo "New code detected:"
+echo "NEW DEPLOYMENT CONTENT"
 echo "----------------------------------------------------------------"
 
-find "$SOURCE_DIR" -maxdepth 2 -type f | head -50
+find "$SOURCE_DIR" -maxdepth 2 -type f | sort | head -50
 
 echo
 echo "----------------------------------------------------------------"
 
 
 # ================================================================
-# CHECK WEBSITE CONFIGURATION
+# CHECK APACHE SERVICE
 # ================================================================
 
-info "Checking website configuration..."
+info "Checking Apache service..."
 
 
-for SITE in "${SITES[@]}"
+if ! systemctl list-unit-files \
+    | awk '{print $1}' \
+    | grep -qx "${APACHE_SERVICE}.service"; then
+
+    error "Apache systemd service not found:"
+    echo "$APACHE_SERVICE"
+
+    exit 1
+
+fi
+
+
+success "Apache service detected."
+
+
+# ================================================================
+# DETECT APACHE VIRTUAL HOSTS
+# ================================================================
+
+info "Detecting Apache VirtualHosts..."
+
+
+if [ ! -d "$APACHE_CONFIG_DIR" ]; then
+
+    error "Apache sites-enabled directory not found:"
+    echo "$APACHE_CONFIG_DIR"
+
+    exit 1
+
+fi
+
+
+# Temporary files
+
+DETECTED_FILE=$(mktemp)
+SERVER_FILE=$(mktemp)
+ROOT_FILE=$(mktemp)
+
+
+# Cleanup temporary files on exit
+
+cleanup_temp()
+{
+    rm -f "$DETECTED_FILE"
+    rm -f "$SERVER_FILE"
+    rm -f "$ROOT_FILE"
+}
+
+trap cleanup_temp EXIT
+
+
+# ================================================================
+# FIND ENABLED APACHE CONFIG FILES
+# ================================================================
+
+CONFIG_FILES=$(find "$APACHE_CONFIG_DIR" \
+    -maxdepth 1 \
+    -type f \
+    \( -name "*.conf" -o -name "*.vhost" \) \
+    | sort)
+
+
+if [ -z "$CONFIG_FILES" ]; then
+
+    error "No Apache VirtualHost configuration files found."
+
+    exit 1
+
+fi
+
+
+# ================================================================
+# EXTRACT DOCUMENT ROOTS
+# ================================================================
+
+while IFS= read -r CONFIG
 do
 
-    SERVICE="${SITE%%|*}"
-    WEB_ROOT="${SITE#*|}"
+    [ -z "$CONFIG" ] && continue
 
 
-    # ------------------------------------------------
-    # Check systemd service
-    # ------------------------------------------------
+    awk '
+    BEGIN {
+        IGNORECASE=1
+    }
 
-    if ! systemctl list-unit-files --type=service \
-        | awk '{print $1}' \
-        | grep -qx "${SERVICE}.service"; then
+    /^[[:space:]]*DocumentRoot[[:space:]]+/ {
 
-        error "Systemd service not found: $SERVICE"
+        gsub(/"/, "", $2)
 
-        exit 1
-
-    fi
+        print $2
+    }
+    ' "$CONFIG" >> "$ROOT_FILE"
 
 
-    # ------------------------------------------------
-    # Check website directory
-    # ------------------------------------------------
+done <<< "$CONFIG_FILES"
+
+
+# ================================================================
+# REMOVE DUPLICATES
+# ================================================================
+
+sort -u "$ROOT_FILE" -o "$ROOT_FILE"
+
+
+# ================================================================
+# REMOVE INVALID ROOTS
+# ================================================================
+
+grep '^/' "$ROOT_FILE" > "$ROOT_FILE.tmp"
+
+mv "$ROOT_FILE.tmp" "$ROOT_FILE"
+
+
+# ================================================================
+# CHECK DETECTED DOCUMENT ROOTS
+# ================================================================
+
+if [ ! -s "$ROOT_FILE" ]; then
+
+    error "No Apache DocumentRoot detected."
+
+    exit 1
+
+fi
+
+
+# ================================================================
+# BUILD WEBSITE LIST
+# ================================================================
+
+SITE_COUNT=0
+
+
+while IFS= read -r WEB_ROOT
+do
+
+    [ -z "$WEB_ROOT" ] && continue
+
 
     if [ ! -d "$WEB_ROOT" ]; then
 
-        error "Website directory does not exist:"
+        warning "DocumentRoot does not currently exist:"
         echo "$WEB_ROOT"
 
-        exit 1
+        continue
 
     fi
 
-done
+
+    # Extract ServerName associated with this DocumentRoot
+
+    SERVER_NAME=$(grep -R -B 30 -A 5 \
+        -iE "^[[:space:]]*DocumentRoot[[:space:]]+$WEB_ROOT([[:space:]]|$)" \
+        "$APACHE_CONFIG_DIR" 2>/dev/null \
+        | grep -iE "^[[:space:]]*ServerName[[:space:]]+" \
+        | tail -1 \
+        | awk '{print $2}')
 
 
-success "All website configurations are valid."
+    if [ -z "$SERVER_NAME" ]; then
+
+        SERVER_NAME=$(basename "$WEB_ROOT")
+
+    fi
+
+
+    echo "$SERVER_NAME|$WEB_ROOT" >> "$DETECTED_FILE"
+
+    SITE_COUNT=$((SITE_COUNT + 1))
+
+
+done < "$ROOT_FILE"
 
 
 # ================================================================
-# CURRENT STATUS
+# CHECK NUMBER OF SITES
+# ================================================================
+
+if [ "$SITE_COUNT" -eq 0 ]; then
+
+    error "No valid Apache websites were detected."
+
+    exit 1
+
+fi
+
+
+# ================================================================
+# DISPLAY DETECTED SITES
 # ================================================================
 
 echo
 echo "================================================================"
-echo "                    CURRENT STATUS"
+echo "                DETECTED APACHE WEBSITES"
 echo "================================================================"
 
-printf "%-25s %-15s\n" "WEBSITE" "STATUS"
+printf "%-35s %-60s\n" "SITE" "DOCUMENT ROOT"
 
 echo "----------------------------------------------------------------"
 
 
-for SITE in "${SITES[@]}"
+while IFS='|' read -r SITE_NAME WEB_ROOT
 do
 
-    SERVICE="${SITE%%|*}"
+    printf "%-35s %-60s\n" \
+        "$SITE_NAME" \
+        "$WEB_ROOT"
+
+done < "$DETECTED_FILE"
 
 
-    if systemctl is-active --quiet "$SERVICE"; then
+echo "----------------------------------------------------------------"
 
-        printf "%-25s ${GREEN}%-15s${NC}\n" \
-            "$SERVICE" "RUNNING"
-
-    else
-
-        printf "%-25s ${RED}%-15s${NC}\n" \
-            "$SERVICE" "STOPPED"
-
-    fi
-
-done
-
+echo
+echo "Total detected sites: $SITE_COUNT"
 
 echo
 echo "================================================================"
 
 
 # ================================================================
-# DEPLOYMENT CONFIRMATION
+# APACHE CONFIGURATION CHECK
+# ================================================================
+
+info "Testing current Apache configuration..."
+
+
+if ! "$APACHECTL" configtest; then
+
+    error "Current Apache configuration is INVALID."
+
+    error "Deployment stopped."
+
+    exit 1
+
+fi
+
+
+success "Current Apache configuration is valid."
+
+
+# ================================================================
+# DRY RUN
+# ================================================================
+
+if [ "$DRY_RUN" = true ]; then
+
+    echo
+    echo "================================================================"
+    echo -e "${YELLOW}                 DRY RUN COMPLETE${NC}"
+    echo "================================================================"
+    echo
+    echo "No files were changed."
+    echo "No websites were stopped."
+    echo "No websites were started."
+    echo
+    echo "Detected sites:"
+    echo
+
+    cat "$DETECTED_FILE"
+
+    echo
+    exit 0
+
+fi
+
+
+# ================================================================
+# CONFIRMATION
 # ================================================================
 
 echo
-echo "The above websites will be updated."
+echo -e "${YELLOW}WARNING:${NC}"
 echo
-echo "Source:"
-echo "  $SOURCE_DIR"
+echo "The contents of the detected DocumentRoot directories"
+echo "will be replaced with the contents of:"
 echo
-echo "Backup:"
-echo "  $BACKUP_DIR"
+echo "    $SOURCE_DIR"
+echo
+echo "A backup will be created before deletion."
+echo
+echo "Number of websites:"
+echo
+echo "    $SITE_COUNT"
 echo
 
 
@@ -344,7 +616,7 @@ read -rp "Continue deployment? [Y/n]: " CONFIRM
 
 if [[ "$CONFIRM" =~ ^[Nn]$ ]]; then
 
-    warning "Deployment cancelled."
+    warning "Deployment cancelled by user."
 
     exit 0
 
@@ -352,7 +624,14 @@ fi
 
 
 # ================================================================
-# BACKUP CURRENT WEBSITE CODE
+# CREATE BACKUP DIRECTORY
+# ================================================================
+
+mkdir -p "$BACKUP_DIR"
+
+
+# ================================================================
+# BACKUP ALL WEBSITES
 # ================================================================
 
 echo
@@ -361,112 +640,195 @@ echo "                    BACKUP PHASE"
 echo "================================================================"
 
 
-for SITE in "${SITES[@]}"
+BACKUP_FAILURE=false
+
+
+while IFS='|' read -r SITE_NAME WEB_ROOT
 do
 
-    SERVICE="${SITE%%|*}"
-    WEB_ROOT="${SITE#*|}"
+    SAFE_NAME=$(echo "$SITE_NAME" | sed 's/[^a-zA-Z0-9._-]/_/g')
 
-    SITE_BACKUP="$BACKUP_DIR/$SERVICE"
-
+    SITE_BACKUP="$BACKUP_DIR/$SAFE_NAME"
 
     mkdir -p "$SITE_BACKUP"
 
 
-    info "Creating backup for $SERVICE..."
+    info "Backing up:"
+    echo "    $WEB_ROOT"
+    echo "    -> $SITE_BACKUP"
 
 
     if cp -a "$WEB_ROOT/." "$SITE_BACKUP/"; then
 
-        success "Backup completed: $SERVICE"
+        success "Backup completed: $SITE_NAME"
 
     else
 
-        error "Backup FAILED: $SERVICE"
+        error "Backup FAILED: $SITE_NAME"
 
-        error "Deployment stopped."
-
-        exit 1
+        BACKUP_FAILURE=true
 
     fi
 
-done
+
+done < "$DETECTED_FILE"
+
+
+# ================================================================
+# BACKUP FAILURE
+# ================================================================
+
+if [ "$BACKUP_FAILURE" = true ]; then
+
+    error "One or more backups failed."
+
+    error "Deployment ABORTED."
+
+    exit 1
+
+fi
 
 
 success "All website backups completed."
 
 
 # ================================================================
-# STOP ALL WEBSITES
+# STOP APACHE
 # ================================================================
 
 echo
 echo "================================================================"
-echo "                    STOPPING WEBSITES"
+echo "                    STOPPING APACHE"
 echo "================================================================"
 
 
-for SITE in "${SITES[@]}"
-do
-
-    SERVICE="${SITE%%|*}"
+info "Stopping Apache..."
 
 
-    info "Stopping $SERVICE..."
+if ! systemctl stop "$APACHE_SERVICE"; then
+
+    error "Failed to stop Apache."
+
+    exit 1
+
+fi
 
 
-    if systemctl stop "$SERVICE"; then
-
-        success "$SERVICE stop command completed."
-
-    else
-
-        error "Failed to stop $SERVICE."
-
-        exit 1
-
-    fi
-
-done
+sleep 2
 
 
 # ================================================================
-# VERIFY ALL WEBSITES STOPPED
+# VERIFY APACHE STOPPED
 # ================================================================
 
-echo
-info "Verifying website services are stopped..."
+if systemctl is-active --quiet "$APACHE_SERVICE"; then
 
-
-STOP_FAILURE=0
-
-
-for SITE in "${SITES[@]}"
-do
-
-    SERVICE="${SITE%%|*}"
-
-
-    if systemctl is-active --quiet "$SERVICE"; then
-
-        error "$SERVICE is STILL RUNNING."
-
-        STOP_FAILURE=1
-
-    else
-
-        success "$SERVICE is stopped."
-
-    fi
-
-done
-
-
-if [ "$STOP_FAILURE" -ne 0 ]; then
-
-    error "One or more websites could not be stopped."
+    error "Apache is still running."
 
     error "Deployment aborted."
+
+    systemctl start "$APACHE_SERVICE"
+
+    exit 1
+
+fi
+
+
+success "Apache stopped successfully."
+
+
+# ================================================================
+# DELETE OLD WEBSITE CONTENT
+# ================================================================
+
+echo
+echo "================================================================"
+echo "                 REMOVING OLD WEBSITE CODE"
+echo "================================================================"
+
+
+DELETE_FAILURE=false
+
+
+while IFS='|' read -r SITE_NAME WEB_ROOT
+do
+
+    info "Removing old content:"
+    echo "    $WEB_ROOT"
+
+
+    # ------------------------------------------------------------
+    # SAFETY CHECK
+    # ------------------------------------------------------------
+
+    if [ -z "$WEB_ROOT" ]; then
+
+        error "Empty DocumentRoot detected."
+
+        DELETE_FAILURE=true
+
+        continue
+
+    fi
+
+
+    if [ "$WEB_ROOT" = "/" ]; then
+
+        error "DANGEROUS DocumentRoot detected: /"
+
+        DELETE_FAILURE=true
+
+        continue
+
+    fi
+
+
+    if [ "$WEB_ROOT" = "/var/www" ]; then
+
+        error "DANGEROUS broad DocumentRoot detected: /var/www"
+
+        DELETE_FAILURE=true
+
+        continue
+
+    fi
+
+
+    # ------------------------------------------------------------
+    # DELETE CONTENT ONLY
+    # ------------------------------------------------------------
+
+    if find "$WEB_ROOT" \
+        -mindepth 1 \
+        -maxdepth 1 \
+        -exec rm -rf -- {} +; then
+
+        success "Old content removed: $SITE_NAME"
+
+    else
+
+        error "Failed to remove old content: $SITE_NAME"
+
+        DELETE_FAILURE=true
+
+    fi
+
+
+done < "$DETECTED_FILE"
+
+
+# ================================================================
+# DELETE FAILURE
+# ================================================================
+
+if [ "$DELETE_FAILURE" = true ]; then
+
+    error "Website cleanup failed."
+
+    error "Starting rollback..."
+
+    # Start Apache first
+    systemctl start "$APACHE_SERVICE"
 
     exit 1
 
@@ -474,48 +836,7 @@ fi
 
 
 # ================================================================
-# REMOVE OLD CODE
-# ================================================================
-
-echo
-echo "================================================================"
-echo "                  REMOVING OLD CODE"
-echo "================================================================"
-
-
-for SITE in "${SITES[@]}"
-do
-
-    SERVICE="${SITE%%|*}"
-    WEB_ROOT="${SITE#*|}"
-
-
-    info "Removing old code from $SERVICE..."
-
-
-    # Safety check
-    if [ -z "$WEB_ROOT" ] || [ "$WEB_ROOT" = "/" ]; then
-
-        error "Unsafe WEB_ROOT detected."
-
-        exit 1
-
-    fi
-
-
-    find "$WEB_ROOT" \
-        -mindepth 1 \
-        -maxdepth 1 \
-        -exec rm -rf -- {} +
-
-
-    success "Old code removed from $SERVICE."
-
-done
-
-
-# ================================================================
-# COPY NEW CODE
+# COPY NEW WEBSITE CODE
 # ================================================================
 
 echo
@@ -524,43 +845,80 @@ echo "                    DEPLOYING NEW CODE"
 echo "================================================================"
 
 
-COPY_FAILURE=0
+COPY_FAILURE=false
 
 
-for SITE in "${SITES[@]}"
+while IFS='|' read -r SITE_NAME WEB_ROOT
 do
 
-    SERVICE="${SITE%%|*}"
-    WEB_ROOT="${SITE#*|}"
-
-
-    info "Copying new code to $SERVICE..."
+    info "Deploying code to:"
+    echo "    $SITE_NAME"
+    echo "    $WEB_ROOT"
 
 
     if cp -a "$SOURCE_DIR/." "$WEB_ROOT/"; then
 
-        success "New code copied to $SERVICE."
+        success "Code deployed: $SITE_NAME"
 
     else
 
-        error "Failed to copy code to $SERVICE."
+        error "Code deployment FAILED: $SITE_NAME"
 
-        COPY_FAILURE=1
+        COPY_FAILURE=true
 
     fi
 
-done
+
+done < "$DETECTED_FILE"
 
 
 # ================================================================
 # COPY FAILURE
 # ================================================================
 
-if [ "$COPY_FAILURE" -ne 0 ]; then
+if [ "$COPY_FAILURE" = true ]; then
 
-    error "Code deployment failed."
+    error "One or more websites failed during deployment."
 
-    error "Starting rollback..."
+    if [ "$ROLLBACK_ENABLED" = true ]; then
+
+        error "Rollback will be attempted."
+
+        # --------------------------------------------------------
+        # ROLLBACK
+        # --------------------------------------------------------
+
+        while IFS='|' read -r SITE_NAME WEB_ROOT
+        do
+
+            SAFE_NAME=$(echo "$SITE_NAME" | sed 's/[^a-zA-Z0-9._-]/_/g')
+
+            SITE_BACKUP="$BACKUP_DIR/$SAFE_NAME"
+
+
+            if [ -d "$SITE_BACKUP" ]; then
+
+                info "Restoring $SITE_NAME..."
+
+                find "$WEB_ROOT" \
+                    -mindepth 1 \
+                    -maxdepth 1 \
+                    -exec rm -rf -- {} +
+
+
+                cp -a "$SITE_BACKUP/." "$WEB_ROOT/"
+
+
+                success "Rollback completed: $SITE_NAME"
+
+            fi
+
+        done < "$DETECTED_FILE"
+
+    fi
+
+
+    systemctl start "$APACHE_SERVICE"
 
     exit 1
 
@@ -568,23 +926,19 @@ fi
 
 
 # ================================================================
-# SET OWNERSHIP AND PERMISSIONS
+# SET PERMISSIONS
 # ================================================================
 
 echo
 echo "================================================================"
-echo "                 SETTING PERMISSIONS"
+echo "                    SETTING PERMISSIONS"
 echo "================================================================"
 
 
-for SITE in "${SITES[@]}"
+while IFS='|' read -r SITE_NAME WEB_ROOT
 do
 
-    SERVICE="${SITE%%|*}"
-    WEB_ROOT="${SITE#*|}"
-
-
-    info "Setting permissions for $SERVICE..."
+    info "Setting permissions: $SITE_NAME"
 
 
     if id www-data >/dev/null 2>&1; then
@@ -597,18 +951,25 @@ do
 
     else
 
-        warning "Apache user not detected."
+        warning "Apache user could not be detected."
 
     fi
 
 
-    find "$WEB_ROOT" -type d -exec chmod 755 {} \;
-    find "$WEB_ROOT" -type f -exec chmod 644 {} \;
+    find "$WEB_ROOT" \
+        -type d \
+        -exec chmod 755 {} \;
 
 
-    success "Permissions configured for $SERVICE."
+    find "$WEB_ROOT" \
+        -type f \
+        -exec chmod 644 {} \;
 
-done
+
+    success "Permissions configured: $SITE_NAME"
+
+
+done < "$DETECTED_FILE"
 
 
 # ================================================================
@@ -621,160 +982,103 @@ echo "                APACHE CONFIGURATION TEST"
 echo "================================================================"
 
 
-if command -v apache2ctl >/dev/null 2>&1; then
+if ! "$APACHECTL" configtest; then
 
-    if apache2ctl configtest; then
+    error "Apache configuration test FAILED."
 
-        success "Apache configuration test PASSED."
+    if [ "$ROLLBACK_ENABLED" = true ]; then
 
-    else
+        error "Starting rollback..."
 
-        error "Apache configuration test FAILED."
+        while IFS='|' read -r SITE_NAME WEB_ROOT
+        do
 
-        error "Deployment cannot continue."
+            SAFE_NAME=$(echo "$SITE_NAME" | sed 's/[^a-zA-Z0-9._-]/_/g')
 
-        exit 1
+            SITE_BACKUP="$BACKUP_DIR/$SAFE_NAME"
+
+
+            if [ -d "$SITE_BACKUP" ]; then
+
+                find "$WEB_ROOT" \
+                    -mindepth 1 \
+                    -maxdepth 1 \
+                    -exec rm -rf -- {} +
+
+
+                cp -a "$SITE_BACKUP/." "$WEB_ROOT/"
+
+                success "Restored: $SITE_NAME"
+
+            fi
+
+        done < "$DETECTED_FILE"
 
     fi
 
 
-elif command -v apachectl >/dev/null 2>&1; then
+    systemctl start "$APACHE_SERVICE"
 
-    if apachectl configtest; then
-
-        success "Apache configuration test PASSED."
-
-    else
-
-        error "Apache configuration test FAILED."
-
-        exit 1
-
-    fi
-
-
-else
-
-    warning "Apache configuration test command not found."
+    exit 1
 
 fi
 
 
+success "Apache configuration test PASSED."
+
+
 # ================================================================
-# START ALL WEBSITES
+# START APACHE
 # ================================================================
 
 echo
 echo "================================================================"
-echo "                    STARTING WEBSITES"
+echo "                    STARTING APACHE"
 echo "================================================================"
 
 
-for SITE in "${SITES[@]}"
-do
-
-    SERVICE="${SITE%%|*}"
+info "Starting Apache..."
 
 
-    info "Starting $SERVICE..."
+if ! systemctl start "$APACHE_SERVICE"; then
+
+    error "Apache failed to start."
 
 
-    if systemctl start "$SERVICE"; then
+    if [ "$ROLLBACK_ENABLED" = true ]; then
 
-        success "$SERVICE start command completed."
+        error "Starting rollback..."
 
-    else
 
-        error "Failed to start $SERVICE."
+        while IFS='|' read -r SITE_NAME WEB_ROOT
+        do
+
+            SAFE_NAME=$(echo "$SITE_NAME" | sed 's/[^a-zA-Z0-9._-]/_/g')
+
+            SITE_BACKUP="$BACKUP_DIR/$SAFE_NAME"
+
+
+            if [ -d "$SITE_BACKUP" ]; then
+
+                find "$WEB_ROOT" \
+                    -mindepth 1 \
+                    -maxdepth 1 \
+                    -exec rm -rf -- {} +
+
+
+                cp -a "$SITE_BACKUP/." "$WEB_ROOT/"
+
+                success "Restored: $SITE_NAME"
+
+            fi
+
+        done < "$DETECTED_FILE"
+
+
+        systemctl start "$APACHE_SERVICE"
 
     fi
 
-done
-
-
-# ================================================================
-# WAIT
-# ================================================================
-
-info "Waiting for services to stabilize..."
-
-sleep 5
-
-
-# ================================================================
-# FINAL STATUS
-# ================================================================
-
-echo
-echo "================================================================"
-echo "                    FINAL STATUS"
-echo "================================================================"
-
-
-printf "%-25s %-15s\n" "WEBSITE" "STATUS"
-
-echo "----------------------------------------------------------------"
-
-
-FINAL_FAILURE=0
-
-
-for SITE in "${SITES[@]}"
-do
-
-    SERVICE="${SITE%%|*}"
-
-
-    if systemctl is-active --quiet "$SERVICE"; then
-
-        printf "%-25s ${GREEN}%-15s${NC}\n" \
-            "$SERVICE" "RUNNING"
-
-    else
-
-        printf "%-25s ${RED}%-15s${NC}\n" \
-            "$SERVICE" "FAILED"
-
-        FINAL_FAILURE=1
-
-    fi
-
-done
-
-
-echo
-echo "================================================================"
-
-
-# ================================================================
-# FAILURE HANDLING
-# ================================================================
-
-if [ "$FINAL_FAILURE" -ne 0 ]; then
-
-    error "One or more websites failed to start."
-
-    echo
-    echo "Deployment backup is available at:"
-    echo
-    echo "$BACKUP_DIR"
-    echo
-
-    echo "Check service logs using:"
-    echo
-
-    for SITE in "${SITES[@]}"
-    do
-
-        SERVICE="${SITE%%|*}"
-
-        echo "journalctl -u $SERVICE -n 50 --no-pager"
-
-    done
-
-    echo
-
-    log "DEPLOYMENT FAILED: $TIMESTAMP"
 
     exit 1
 
@@ -782,25 +1086,168 @@ fi
 
 
 # ================================================================
-# SUCCESS
+# WAIT FOR APACHE
+# ================================================================
+
+info "Waiting for Apache to stabilize..."
+
+sleep 5
+
+
+# ================================================================
+# FINAL APACHE STATUS
 # ================================================================
 
 echo
 echo "================================================================"
-echo -e "${GREEN}             DEPLOYMENT SUCCESSFUL${NC}"
+echo "                    FINAL APACHE STATUS"
+echo "================================================================"
+
+
+if systemctl is-active --quiet "$APACHE_SERVICE"; then
+
+    echo -e "${GREEN}Apache Status : RUNNING${NC}"
+
+else
+
+    echo -e "${RED}Apache Status : FAILED${NC}"
+
+    error "Apache is not running."
+
+    exit 1
+
+fi
+
+
+# ================================================================
+# FINAL WEBSITE REPORT
+# ================================================================
+
+echo
+echo "================================================================"
+echo "                  DEPLOYMENT RESULT"
+echo "================================================================"
+
+printf "%-35s %-60s %-12s\n" \
+    "SITE" \
+    "DOCUMENT ROOT" \
+    "STATUS"
+
+echo "----------------------------------------------------------------"
+
+
+FINAL_FAILURE=false
+
+
+while IFS='|' read -r SITE_NAME WEB_ROOT
+do
+
+    if [ -d "$WEB_ROOT" ] && \
+       [ "$(find "$WEB_ROOT" -mindepth 1 -print -quit)" ]; then
+
+        printf "%-35s %-60s ${GREEN}%-12s${NC}\n" \
+            "$SITE_NAME" \
+            "$WEB_ROOT" \
+            "UPDATED"
+
+    else
+
+        printf "%-35s %-60s ${RED}%-12s${NC}\n" \
+            "$SITE_NAME" \
+            "$WEB_ROOT" \
+            "EMPTY"
+
+        FINAL_FAILURE=true
+
+    fi
+
+done < "$DETECTED_FILE"
+
+
+echo
+echo "================================================================"
+
+
+# ================================================================
+# FINAL RESULT
+# ================================================================
+
+if [ "$FINAL_FAILURE" = true ]; then
+
+    error "Deployment completed with errors."
+
+    log "DEPLOYMENT FAILED: $DEPLOYMENT_ID"
+
+    exit 1
+
+fi
+
+
+success "DEPLOYMENT COMPLETED SUCCESSFULLY."
+
+log "DEPLOYMENT SUCCESSFUL: $DEPLOYMENT_ID"
+
+
+# ================================================================
+# BACKUP CLEANUP
+# ================================================================
+
+info "Cleaning old backups..."
+
+
+BACKUP_COUNT=$(find "$BACKUP_BASE" \
+    -maxdepth 1 \
+    -mindepth 1 \
+    -type d \
+    -name "deployment_*" \
+    | wc -l)
+
+
+if [ "$BACKUP_COUNT" -gt "$BACKUPS_TO_KEEP" ]; then
+
+    DELETE_COUNT=$((BACKUP_COUNT - BACKUPS_TO_KEEP))
+
+
+    find "$BACKUP_BASE" \
+        -maxdepth 1 \
+        -mindepth 1 \
+        -type d \
+        -name "deployment_*" \
+        -printf '%T@ %p\n' \
+        | sort -n \
+        | head -n "$DELETE_COUNT" \
+        | cut -d' ' -f2- \
+        | while IFS= read -r OLD_BACKUP
+        do
+
+            rm -rf "$OLD_BACKUP"
+
+            info "Removed old backup: $OLD_BACKUP"
+
+        done
+
+fi
+
+
+# ================================================================
+# FINAL SUMMARY
+# ================================================================
+
+echo
+echo "================================================================"
+echo -e "${GREEN}                 DEPLOYMENT SUCCESSFUL${NC}"
 echo "================================================================"
 echo
-echo "Deployment ID : $TIMESTAMP"
+echo "Deployment ID : $DEPLOYMENT_ID"
+echo "Sites Updated : $SITE_COUNT"
 echo "Source        : $SOURCE_DIR"
 echo "Backup        : $BACKUP_DIR"
 echo "Log           : $LOG_FILE"
 echo
-echo "All websites are RUNNING."
+echo "Apache Status : RUNNING"
 echo
 echo "================================================================"
-
-
-log "DEPLOYMENT SUCCESSFUL: $TIMESTAMP"
+echo
 
 
 exit 0
