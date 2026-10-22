@@ -1,0 +1,1148 @@
+pipeline {
+
+    agent any
+
+    environment {
+
+        DEPLOYMENT_FILE = 'DEPLOYMENT_FILE'
+        DEPLOYMENT_DIR  = 'deployment'
+        PACKAGE_FILE    = 'deployment.tar.gz'
+
+        REMOTE_HOST     = 'root@172.21.11.130'
+        REMOTE_TMP_BASE = '/tmp'
+
+        BACKUP_BASE     = '/backup-testcrm'
+
+        SERVICES        = 'testcrm,testcrm-2,testcrm-3,testcrm-4,testcrm-5'
+
+        APPLICATION_URL = 'https://172.21.11.130:5888'
+    }
+
+    stages {
+
+        stage('Prepare uploaded ZIP') {
+
+            steps {
+
+                withFileParameter('DEPLOYMENT_FILE') {
+
+                    sh '''#!/bin/bash
+set -euo pipefail
+
+echo "================================================"
+echo "PREPARING UPLOADED FILE"
+echo "================================================"
+
+UPLOAD_FILE="${DEPLOYMENT_FILE}"
+
+echo "Uploaded file:"
+ls -lh "$UPLOAD_FILE"
+echo
+
+echo "File type:"
+file "$UPLOAD_FILE"
+echo
+
+echo "Copying uploaded file to workspace..."
+
+rm -f ./DEPLOYMENT_FILE
+
+cp "$UPLOAD_FILE" ./DEPLOYMENT_FILE
+
+echo
+
+echo "Workspace file:"
+ls -lh ./DEPLOYMENT_FILE
+echo
+
+echo "File prepared successfully."
+'''
+
+                    stash(
+                        name: 'DEPLOYMENT_FILE',
+                        includes: 'DEPLOYMENT_FILE',
+                        useDefaultExcludes: false,
+                        allowEmpty: false
+                    )
+                }
+            }
+        }
+
+
+        stage('Extract deployment') {
+
+            steps {
+
+                deleteDir()
+
+                unstash 'DEPLOYMENT_FILE'
+
+                sh '''#!/bin/bash
+set -euo pipefail
+
+echo "================================================"
+echo "VALIDATING DEPLOYMENT PACKAGE"
+echo "================================================"
+
+if [[ ! -f "DEPLOYMENT_FILE" ]]; then
+    echo "ERROR: DEPLOYMENT_FILE not found."
+    exit 1
+fi
+
+echo
+echo "Uploaded package:"
+ls -lh DEPLOYMENT_FILE
+
+echo
+echo "File type:"
+file DEPLOYMENT_FILE
+
+echo
+echo "Testing ZIP integrity:"
+unzip -t DEPLOYMENT_FILE
+
+echo
+echo "ZIP validation successful."
+
+echo
+echo "Creating deployment directory..."
+
+rm -rf deployment
+mkdir -p deployment
+
+echo
+echo "Extracting ZIP..."
+
+unzip -q DEPLOYMENT_FILE -d deployment
+
+echo
+echo "Validating extracted application..."
+
+if [[ ! -f "deployment/ServerCRM.dll" ]]; then
+    echo "ERROR: ServerCRM.dll not found."
+    exit 1
+fi
+
+if [[ ! -f "deployment/ServerCRM.runtimeconfig.json" ]]; then
+    echo "ERROR: ServerCRM.runtimeconfig.json not found."
+    exit 1
+fi
+
+if [[ ! -f "deployment/ServerCRM.deps.json" ]]; then
+    echo "ERROR: ServerCRM.deps.json not found."
+    exit 1
+fi
+
+if [[ ! -f "deployment/appsettings.json" ]]; then
+    echo "ERROR: appsettings.json not found."
+    exit 1
+fi
+
+if [[ ! -d "deployment/wwwroot" ]]; then
+    echo "ERROR: wwwroot directory not found."
+    exit 1
+fi
+
+echo
+echo "Application validation successful."
+
+echo
+echo "================================================"
+echo "CALCULATING ServerCRM.dll SHA256"
+echo "================================================"
+
+DLL_SHA256="$(sha256sum deployment/ServerCRM.dll | awk '{print $1}')"
+
+echo "ServerCRM.dll SHA256:"
+echo "$DLL_SHA256"
+
+echo "$DLL_SHA256" > deployment-dll-sha256.txt
+
+echo
+echo "Deployment contents:"
+
+find deployment -maxdepth 2 -type f -print | sort > deployment-contents.txt
+
+sed -n '1,100p' deployment-contents.txt
+
+echo
+echo "Creating deployment package..."
+
+rm -f deployment.tar.gz
+
+tar -czf deployment.tar.gz -C deployment .
+
+echo
+echo "Deployment package created:"
+ls -lh deployment.tar.gz
+
+echo
+echo "Package contents:"
+
+tar -tzf deployment.tar.gz > deployment-package-contents.txt
+
+sed -n '1,50p' deployment-package-contents.txt
+
+echo
+echo "Deployment package preparation successful."
+'''
+
+                stash(
+                    name: 'deployment-package',
+                    includes: 'deployment.tar.gz,deployment-dll-sha256.txt',
+                    useDefaultExcludes: false,
+                    allowEmpty: false
+                )
+            }
+        }
+
+
+        stage('Deploy to all CRM services') {
+
+            steps {
+
+                unstash 'deployment-package'
+
+                sshagent(credentials: ['172.21.11.130']) {
+
+                    sh '''#!/bin/bash
+set -euo pipefail
+
+LOG_FILE="crm-deployment-${BUILD_NUMBER}.log"
+
+TIMESTAMP="$(date +%Y-%m-%d_%H-%M-%S)"
+
+REMOTE_TMP="${REMOTE_TMP_BASE}/crm-deploy-${BUILD_NUMBER}-${TIMESTAMP}"
+
+REMOTE_PACKAGE="${REMOTE_TMP}/deployment.tar.gz"
+
+
+log() {
+    echo "$*" | tee -a "$LOG_FILE"
+}
+
+
+run_remote() {
+
+    ssh \\
+        -o StrictHostKeyChecking=no \\
+        -o UserKnownHostsFile=/dev/null \\
+        "$REMOTE_HOST" "$@"
+}
+
+
+copy_package() {
+
+    scp \\
+        -o StrictHostKeyChecking=no \\
+        -o UserKnownHostsFile=/dev/null \\
+        "$PACKAGE_FILE" \\
+        "${REMOTE_HOST}:${REMOTE_TMP}/deployment.tar.gz"
+}
+
+
+cleanup_remote_temp() {
+
+    log ""
+    log "Cleaning remote temporary directory..."
+
+    run_remote "rm -rf \\"$REMOTE_TMP\\"" || true
+}
+
+
+rollback_deployment() {
+
+    local SERVICE_NAME="$1"
+    local DEPLOY_PATH="$2"
+    local BACKUP_PATH="$3"
+
+    log ""
+    log "================================================"
+    log "ROLLBACK STARTED"
+    log "SERVICE: $SERVICE_NAME"
+    log "================================================"
+
+    log "Stopping $SERVICE_NAME service..."
+
+    run_remote "systemctl stop \\"$SERVICE_NAME\\" || true"
+
+
+    if [[ -n "$BACKUP_PATH" ]] && \
+       run_remote "test -f \\"$BACKUP_PATH/ServerCRM.dll\\""; then
+
+        log "Valid backup found:"
+        log "$BACKUP_PATH"
+
+        log ""
+        log "Removing failed deployment..."
+
+        run_remote "
+            rm -rf \\"$DEPLOY_PATH\\"
+            mkdir -p \\"$DEPLOY_PATH\\"
+        "
+
+
+        log ""
+        log "Restoring backup..."
+
+        run_remote "
+            cp -a \\"$BACKUP_PATH\\"/. \\"$DEPLOY_PATH\\"/
+        "
+
+
+        log ""
+        log "Restoring permissions..."
+
+        run_remote "
+            chown -R www-data:www-data \\"$DEPLOY_PATH\\" 2>/dev/null || true
+        "
+
+
+        log ""
+        log "Starting $SERVICE_NAME service after rollback..."
+
+        if run_remote "systemctl start \\"$SERVICE_NAME\\""; then
+
+            log "$SERVICE_NAME service started after rollback."
+
+        else
+
+            log "WARNING: $SERVICE_NAME service could not be started after rollback."
+
+        fi
+
+
+        log ""
+        log "Verifying rollback service state..."
+
+        if run_remote "systemctl is-active --quiet \\"$SERVICE_NAME\\""; then
+
+            log "$SERVICE_NAME service is active after rollback."
+
+        else
+
+            log "WARNING: $SERVICE_NAME service is NOT active after rollback."
+
+        fi
+
+
+        log ""
+        log "Rollback completed."
+
+    else
+
+        log ""
+        log "WARNING: No valid backup available."
+
+        log "Starting $SERVICE_NAME service without backup restoration..."
+
+        run_remote "systemctl start \\"$SERVICE_NAME\\" || true"
+
+    fi
+}
+
+
+log "================================================"
+log " CRM APPLICATION DEPLOYMENT"
+log "================================================"
+
+log "Build          : ${BUILD_NUMBER}"
+log "Server         : ${REMOTE_HOST}"
+log "Services       : ${SERVICES}"
+log "Application URL: ${APPLICATION_URL}"
+log "Remote temp    : ${REMOTE_TMP}"
+log ""
+
+
+# ================================================================
+# CHECK LOCAL PACKAGE
+# ================================================================
+
+log "================================================"
+log "CHECKING LOCAL PACKAGE"
+log "================================================"
+
+if [[ ! -f "$PACKAGE_FILE" ]]; then
+
+    log "ERROR: $PACKAGE_FILE not found."
+
+    exit 1
+
+fi
+
+if [[ ! -f "deployment-dll-sha256.txt" ]]; then
+
+    log "ERROR: deployment-dll-sha256.txt not found."
+
+    exit 1
+
+fi
+
+PACKAGE_SHA256="$(sha256sum "$PACKAGE_FILE" | awk '{print $1}')"
+
+EXPECTED_DLL_SHA256="$(cat deployment-dll-sha256.txt)"
+
+log "Package:"
+ls -lh "$PACKAGE_FILE" | tee -a "$LOG_FILE"
+
+log ""
+log "Deployment package SHA256:"
+log "$PACKAGE_SHA256"
+
+log ""
+log "Expected ServerCRM.dll SHA256:"
+log "$EXPECTED_DLL_SHA256"
+
+
+# ================================================================
+# CHECK SSH CONNECTION
+# ================================================================
+
+log ""
+
+log "================================================"
+log "CHECKING SSH CONNECTION"
+log "================================================"
+
+if ! run_remote "hostname && whoami"; then
+
+    log "ERROR: SSH connection failed."
+
+    exit 1
+
+fi
+
+log "SSH connection successful."
+
+
+# ================================================================
+# CREATE REMOTE TEMP DIRECTORY
+# ================================================================
+
+log ""
+
+log "================================================"
+log "CREATING REMOTE TEMP DIRECTORY"
+log "================================================"
+
+run_remote "
+    mkdir -p \\"$REMOTE_TMP\\"
+    chmod 700 \\"$REMOTE_TMP\\"
+"
+
+log "Remote temporary directory created."
+
+
+# ================================================================
+# TRANSFER DEPLOYMENT PACKAGE
+# ================================================================
+
+log ""
+
+log "================================================"
+log "TRANSFERRING DEPLOYMENT PACKAGE"
+log "================================================"
+
+copy_package
+
+log "Deployment package transferred successfully."
+
+
+# ================================================================
+# VERIFY REMOTE PACKAGE
+# ================================================================
+
+log ""
+
+log "================================================"
+log "VERIFYING REMOTE PACKAGE"
+log "================================================"
+
+run_remote "ls -lh \\"$REMOTE_PACKAGE\\""
+
+run_remote "tar -tzf \\"$REMOTE_PACKAGE\\" >/dev/null"
+
+REMOTE_PACKAGE_SHA256="$(
+    run_remote "sha256sum \\"$REMOTE_PACKAGE\\" | awk '{print \\$1}'"
+)"
+
+log ""
+log "Local package SHA256:"
+log "$PACKAGE_SHA256"
+
+log "Remote package SHA256:"
+log "$REMOTE_PACKAGE_SHA256"
+
+if [[ "$PACKAGE_SHA256" != "$REMOTE_PACKAGE_SHA256" ]]; then
+
+    log "ERROR: Remote package SHA256 does not match local package."
+
+    cleanup_remote_temp
+
+    exit 1
+
+fi
+
+log "Remote package SHA256 verified successfully."
+
+
+# ================================================================
+# CREATE ONE COMMON BACKUP
+# ================================================================
+
+BACKUP_SOURCE="/var/www/testcrm"
+BACKUP_PATH="${BACKUP_BASE}/build-${BUILD_NUMBER}_${TIMESTAMP}"
+
+log ""
+log "================================================"
+log "CREATING ONE COMMON BACKUP"
+log "================================================"
+
+log "Backup source: ${BACKUP_SOURCE}"
+log "Backup path  : ${BACKUP_PATH}"
+
+run_remote "mkdir -p \\"$BACKUP_BASE\\""
+
+
+if run_remote "test -d \\"$BACKUP_SOURCE\\" && test -f \\"$BACKUP_SOURCE/ServerCRM.dll\\""; then
+
+    log "Existing valid deployment found."
+
+    run_remote "
+        rm -rf \\"$BACKUP_PATH\\"
+        mkdir -p \\"$BACKUP_PATH\\"
+        cp -a \\"$BACKUP_SOURCE\\"/. \\"$BACKUP_PATH\\"/
+    "
+
+    if ! run_remote "test -f \\"$BACKUP_PATH/ServerCRM.dll\\""; then
+
+        log "ERROR: Backup validation failed."
+
+        cleanup_remote_temp
+
+        exit 1
+
+    fi
+
+    BACKUP_DLL_SHA256="$(
+        run_remote "sha256sum \\"$BACKUP_PATH/ServerCRM.dll\\" | awk '{print \\$1}'"
+    )"
+
+    log ""
+    log "Backup ServerCRM.dll SHA256:"
+    log "$BACKUP_DLL_SHA256"
+
+    log ""
+    log "Backup created and validated successfully."
+
+    
+    
+    # CREATE DOWNLOADABLE PREVIOUS-VERSION ZIP
+
+    BACKUP_ARTIFACT="testcrm-previous-source-${BUILD_NUMBER}.zip"
+    REMOTE_BACKUP_ZIP="${REMOTE_TMP}/${BACKUP_ARTIFACT}"
+
+    log "Creating previous-version ZIP on remote server..."
+
+    run_remote "python3 - '$BACKUP_PATH' '$REMOTE_BACKUP_ZIP'" <<'PYTHON'
+import os
+import sys
+import zipfile
+
+root = os.path.abspath(sys.argv[1])
+out = os.path.abspath(sys.argv[2])
+
+if not os.path.isdir(root):
+    raise RuntimeError("Backup directory does not exist: " + root)
+
+with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as archive:
+    for directory, subdirs, files in os.walk(root):
+        for filename in files:
+            full_path = os.path.join(directory, filename)
+            archive.write(full_path, os.path.relpath(full_path, root))
+
+if not os.path.isfile(out) or os.path.getsize(out) == 0:
+    raise RuntimeError("ZIP creation failed: " + out)
+
+print("ZIP created successfully:", out)
+PYTHON
+
+    log "Downloading previous-version ZIP to Jenkins..."
+
+    scp \
+        -o StrictHostKeyChecking=no \
+        -o UserKnownHostsFile=/dev/null \
+        "${REMOTE_HOST}:${REMOTE_BACKUP_ZIP}" \
+        "$BACKUP_ARTIFACT"
+
+    if [[ ! -s "$BACKUP_ARTIFACT" ]]; then
+        log "ERROR: Previous-version ZIP is missing or empty."
+        cleanup_remote_temp
+        exit 1
+    fi
+
+    log "Previous-version ZIP downloaded successfully:"
+    ls -lh "$BACKUP_ARTIFACT" | tee -a "$LOG_FILE"
+
+else
+
+    log "WARNING: No valid existing deployment found."
+
+    log "This is being treated as the first deployment."
+
+    BACKUP_PATH=""
+
+fi
+
+
+# ================================================================
+# DEPLOY SERVICES
+# ================================================================
+
+IFS=',' read -ra SERVICE_LIST <<< "$SERVICES"
+
+SUCCESSFUL_SERVICES=""
+
+for SERVICE_NAME in "${SERVICE_LIST[@]}"; do
+
+    DEPLOY_PATH="/var/www/${SERVICE_NAME}"
+
+    REMOTE_DEPLOY_DIR="${REMOTE_TMP}/${SERVICE_NAME}"
+
+    log ""
+    log "################################################"
+    log "# DEPLOYING SERVICE: ${SERVICE_NAME}"
+    log "################################################"
+
+    log "Service      : ${SERVICE_NAME}"
+    log "Deploy path  : ${DEPLOY_PATH}"
+
+    if [[ -n "$BACKUP_PATH" ]]; then
+        log "Backup path  : ${BACKUP_PATH}"
+    else
+        log "Backup path  : NONE - FIRST DEPLOYMENT"
+    fi
+
+
+    # ============================================================
+    # PREPARE TEMPORARY DEPLOYMENT DIRECTORY
+    # ============================================================
+
+    log ""
+    log "================================================"
+    log "PREPARING TEMPORARY DEPLOYMENT"
+    log "================================================"
+
+    run_remote "
+        rm -rf \\"$REMOTE_DEPLOY_DIR\\"
+        mkdir -p \\"$REMOTE_DEPLOY_DIR\\"
+    "
+
+    log "Temporary deployment directory:"
+    log "$REMOTE_DEPLOY_DIR"
+
+
+    # ============================================================
+    # EXTRACT NEW DEPLOYMENT TO TEMPORARY DIRECTORY
+    # ============================================================
+
+    log ""
+    log "================================================"
+    log "EXTRACTING NEW DEPLOYMENT"
+    log "================================================"
+
+    run_remote "
+        tar -xzf \\"$REMOTE_PACKAGE\\" -C \\"$REMOTE_DEPLOY_DIR\\"
+    "
+
+    log "Package extracted to temporary directory."
+
+
+    # ============================================================
+    # VALIDATE TEMPORARY DEPLOYMENT
+    # ============================================================
+
+    log ""
+    log "================================================"
+    log "VALIDATING TEMPORARY DEPLOYMENT"
+    log "================================================"
+
+    if ! run_remote "
+
+        test -f \\"$REMOTE_DEPLOY_DIR/ServerCRM.dll\\"
+
+        test -f \\"$REMOTE_DEPLOY_DIR/ServerCRM.runtimeconfig.json\\"
+
+        test -f \\"$REMOTE_DEPLOY_DIR/ServerCRM.deps.json\\"
+
+        test -f \\"$REMOTE_DEPLOY_DIR/appsettings.json\\"
+
+        test -d \\"$REMOTE_DEPLOY_DIR/wwwroot\\"
+
+    "; then
+
+        log "ERROR: Temporary deployment validation failed."
+
+        cleanup_remote_temp
+
+        exit 1
+
+    fi
+
+    log "Temporary deployment validation successful."
+
+
+    # ============================================================
+    # VERIFY TEMPORARY DLL SHA256
+    # ============================================================
+
+    log ""
+    log "================================================"
+    log "VERIFYING ServerCRM.dll SHA256"
+    log "================================================"
+
+    DEPLOYED_DLL_SHA256="$(
+        run_remote "sha256sum \\"$REMOTE_DEPLOY_DIR/ServerCRM.dll\\" | awk '{print \\$1}'"
+    )"
+
+    log "Expected SHA256:"
+    log "$EXPECTED_DLL_SHA256"
+
+    log ""
+    log "Remote temporary DLL SHA256:"
+    log "$DEPLOYED_DLL_SHA256"
+
+    if [[ "$EXPECTED_DLL_SHA256" != "$DEPLOYED_DLL_SHA256" ]]; then
+
+        log "ERROR: ServerCRM.dll SHA256 mismatch."
+
+        cleanup_remote_temp
+
+        exit 1
+
+    fi
+
+    log "ServerCRM.dll SHA256 verified successfully."
+
+
+    # ============================================================
+    # STOP SERVICE
+    # ============================================================
+
+    log ""
+    log "================================================"
+    log "STOPPING ${SERVICE_NAME} SERVICE"
+    log "================================================"
+
+    if run_remote "systemctl stop \\"$SERVICE_NAME\\""; then
+
+        log "Service stopped successfully."
+
+    else
+
+        log "WARNING: Service stop returned non-zero."
+
+    fi
+
+
+    # ============================================================
+    # INSTALL VALIDATED DEPLOYMENT
+    # ============================================================
+
+    log ""
+    log "================================================"
+    log "INSTALLING VALIDATED DEPLOYMENT"
+    log "================================================"
+
+    run_remote "
+        rm -rf \\"$DEPLOY_PATH\\"
+        mkdir -p \\"$DEPLOY_PATH\\"
+        cp -a \\"$REMOTE_DEPLOY_DIR\\"/. \\"$DEPLOY_PATH\\"/
+    "
+
+    log "Validated application copied to:"
+    log "$DEPLOY_PATH"
+
+
+    # ============================================================
+    # VALIDATE LIVE DEPLOYMENT
+    # ============================================================
+
+    log ""
+    log "================================================"
+    log "VALIDATING LIVE DEPLOYMENT"
+    log "================================================"
+
+    if ! run_remote "
+
+        test -f \\"$DEPLOY_PATH/ServerCRM.dll\\"
+
+        test -f \\"$DEPLOY_PATH/ServerCRM.runtimeconfig.json\\"
+
+        test -f \\"$DEPLOY_PATH/ServerCRM.deps.json\\"
+
+        test -f \\"$DEPLOY_PATH/appsettings.json\\"
+
+        test -d \\"$DEPLOY_PATH/wwwroot\\"
+
+    "; then
+
+        log "ERROR: Live deployment validation failed."
+
+        rollback_deployment "$SERVICE_NAME" "$DEPLOY_PATH" "$BACKUP_PATH"
+
+        cleanup_remote_temp
+
+        exit 1
+
+    fi
+
+    log "Live application validation successful."
+
+
+    # ============================================================
+    # VERIFY LIVE DLL SHA256
+    # ============================================================
+
+    log ""
+    log "================================================"
+    log "VERIFYING LIVE ServerCRM.dll SHA256"
+    log "================================================"
+
+    LIVE_DLL_SHA256="$(
+        run_remote "sha256sum \\"$DEPLOY_PATH/ServerCRM.dll\\" | awk '{print \\$1}'"
+    )"
+
+    log "Expected SHA256:"
+    log "$EXPECTED_DLL_SHA256"
+
+    log ""
+    log "Live ServerCRM.dll SHA256:"
+    log "$LIVE_DLL_SHA256"
+
+    if [[ "$EXPECTED_DLL_SHA256" != "$LIVE_DLL_SHA256" ]]; then
+
+        log "ERROR: Live ServerCRM.dll SHA256 mismatch."
+
+        rollback_deployment "$SERVICE_NAME" "$DEPLOY_PATH" "$BACKUP_PATH"
+
+        cleanup_remote_temp
+
+        exit 1
+
+    fi
+
+    log "Live ServerCRM.dll SHA256 verified successfully."
+
+
+    # ============================================================
+    # SET PERMISSIONS
+    # ============================================================
+
+    log ""
+    log "================================================"
+    log "SETTING PERMISSIONS"
+    log "================================================"
+
+    run_remote "
+        chown -R www-data:www-data \\"$DEPLOY_PATH\\" 2>/dev/null || true
+    "
+
+    log "Permissions updated where applicable."
+
+
+    # ============================================================
+    # ENABLE SERVICE
+    # ============================================================
+
+    log ""
+    log "================================================"
+    log "ENABLING ${SERVICE_NAME} SERVICE"
+    log "================================================"
+
+    if ! run_remote "systemctl enable \\"$SERVICE_NAME\\""; then
+
+        log "ERROR: Failed to enable $SERVICE_NAME service."
+
+        rollback_deployment "$SERVICE_NAME" "$DEPLOY_PATH" "$BACKUP_PATH"
+
+        cleanup_remote_temp
+
+        exit 1
+
+    fi
+
+    log "$SERVICE_NAME service enabled."
+
+
+    # ============================================================
+    # START SERVICE
+    # ============================================================
+
+    log ""
+    log "================================================"
+    log "STARTING ${SERVICE_NAME} SERVICE"
+    log "================================================"
+
+    if ! run_remote "systemctl start \\"$SERVICE_NAME\\""; then
+
+        log "ERROR: Failed to start $SERVICE_NAME service."
+
+        rollback_deployment "$SERVICE_NAME" "$DEPLOY_PATH" "$BACKUP_PATH"
+
+        cleanup_remote_temp
+
+        exit 1
+
+    fi
+
+    log "$SERVICE_NAME service started."
+
+
+    # ============================================================
+    # WAIT FOR SERVICE
+    # ============================================================
+
+    log ""
+    log "================================================"
+    log "WAITING FOR SERVICE"
+    log "================================================"
+
+    sleep 5
+
+
+    # ============================================================
+    # SERVICE STATUS
+    # ============================================================
+
+    log ""
+    log "================================================"
+    log "${SERVICE_NAME} SERVICE STATUS"
+    log "================================================"
+
+    run_remote "
+        systemctl --no-pager --full status \\"$SERVICE_NAME\\" || true
+    " | tee -a "$LOG_FILE"
+
+
+    # ============================================================
+    # CHECK SERVICE STATE
+    # ============================================================
+
+    log ""
+    log "================================================"
+    log "CHECKING SERVICE STATE"
+    log "================================================"
+
+    if ! run_remote "systemctl is-active --quiet \\"$SERVICE_NAME\\""; then
+
+        log "ERROR: $SERVICE_NAME service is not active."
+
+        log ""
+        log "Recent service logs:"
+
+        run_remote "
+            journalctl -u \\"$SERVICE_NAME\\" -n 100 --no-pager
+        " | tee -a "$LOG_FILE" || true
+
+        rollback_deployment "$SERVICE_NAME" "$DEPLOY_PATH" "$BACKUP_PATH"
+
+        cleanup_remote_temp
+
+        exit 1
+
+    fi
+
+    log "$SERVICE_NAME service is active."
+
+
+    # ============================================================
+    # APPLICATION HEALTH CHECK
+    # ============================================================
+
+    log ""
+    log "================================================"
+    log "APPLICATION HEALTH CHECK"
+    log "================================================"
+
+    HEALTH_OK=0
+
+    for attempt in 1 2 3 4 5; do
+
+        log "Health check attempt $attempt/5..."
+
+        log "Checking application:"
+        log "$APPLICATION_URL"
+
+        if curl \
+            --silent \
+            --show-error \
+            --fail \
+            --max-time 10 \
+            "$APPLICATION_URL" \
+            >/dev/null; then
+
+            HEALTH_OK=1
+
+            log "Application health check successful."
+
+            break
+
+        else
+
+            log "Application health check failed."
+
+        fi
+
+        sleep 3
+
+    done
+
+
+    # ============================================================
+    # HEALTH CHECK FAILED
+    # ============================================================
+
+    if [[ "$HEALTH_OK" -ne 1 ]]; then
+
+        log "ERROR: Application health check failed."
+
+        log ""
+        log "Recent service logs:"
+
+        run_remote "
+            journalctl -u \\"$SERVICE_NAME\\" -n 100 --no-pager
+        " | tee -a "$LOG_FILE" || true
+
+        rollback_deployment "$SERVICE_NAME" "$DEPLOY_PATH" "$BACKUP_PATH"
+
+        cleanup_remote_temp
+
+        exit 1
+
+    fi
+
+
+    # ============================================================
+    # SERVICE DEPLOYMENT SUCCESS
+    # ============================================================
+
+    SUCCESSFUL_SERVICES="${SUCCESSFUL_SERVICES} ${SERVICE_NAME}"
+
+    log ""
+    log "================================================"
+    log "${SERVICE_NAME} DEPLOYMENT SUCCESSFUL"
+    log "================================================"
+
+    log "Service       : ${SERVICE_NAME}"
+    log "Deploy path   : ${DEPLOY_PATH}"
+    log "Application   : ${APPLICATION_URL}"
+    log "DLL SHA256    : ${LIVE_DLL_SHA256}"
+
+
+done
+
+
+# ================================================================
+# ALL DEPLOYMENTS COMPLETED
+# ================================================================
+
+log ""
+log "================================================"
+log "ALL CRM DEPLOYMENTS COMPLETED"
+log "================================================"
+
+log "Build          : ${BUILD_NUMBER}"
+log "Server         : ${REMOTE_HOST}"
+log "Services       : ${SERVICES}"
+log "Application    : ${APPLICATION_URL}"
+log "DLL SHA256     : ${EXPECTED_DLL_SHA256}"
+
+log ""
+log "Successful services:"
+log "${SUCCESSFUL_SERVICES}"
+
+
+# ================================================================
+# CLEAN TEMPORARY REMOTE FILES
+# ================================================================
+
+cleanup_remote_temp
+
+log ""
+log "Remote temporary directory cleaned."
+
+echo "CRM deployment completed successfully."
+'''
+
+                }
+            }
+        }
+    }
+
+
+    post {
+
+        always {
+
+            echo "================================================"
+            echo "ARCHIVING DEPLOYMENT LOG"
+            echo "================================================"
+
+         archiveArtifacts(
+    artifacts: 'crm-deployment-*.log',
+    allowEmptyArchive: false,
+    fingerprint: true
+)
+
+archiveArtifacts(
+    artifacts: 'testcrm-previous-source-*.zip',
+    allowEmptyArchive: true,
+    fingerprint: true
+)
+
+            echo "================================================"
+            echo "CLEANING JENKINS WORKSPACE"
+            echo "================================================"
+
+            sh '''#!/bin/bash
+set +e
+
+rm -f DEPLOYMENT_FILE
+rm -f deployment.tar.gz
+rm -f deployment-dll-sha256.txt
+rm -f deployment-contents.txt
+rm -f deployment-package-contents.txt
+rm -f crm-deployment-*.log
+rm -f vtpl-bcp-previous-source-*.zip
+rm -rf deployment
+
+echo "Workspace cleanup completed."
+'''
+        }
+
+
+        success {
+
+            echo "================================================"
+            echo "CRM DEPLOYMENT SUCCESSFUL"
+            echo "================================================"
+
+          echo "Services: testcrm, testcrm-2, testcrm-3, testcrm-4, testcrm-5"
+
+            echo "Application: https://172.21.11.130:5888"
+        }
+
+
+        failure {
+
+            echo "================================================"
+            echo "CRM DEPLOYMENT FAILED"
+            echo "================================================"
+
+            echo "Automatic rollback was attempted if a previous deployment existed."
+
+            echo "Check the archived deployment log for details."
+        }
+    }
+}
