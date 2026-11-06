@@ -1,0 +1,1524 @@
+
+pipeline {
+    agent any
+
+    options {
+        timestamps()
+        disableConcurrentBuilds()
+        timeout(time: 45, unit: 'MINUTES')
+        buildDiscarder(logRotator(
+            numToKeepStr: '30',
+            artifactNumToKeepStr: '30'
+        ))
+    }
+
+    parameters {
+        string(name: 'SITE_NAME',
+            defaultValue: '',
+            description: 'Required at build time; unique application/service base name')
+
+        string(name: 'PORT',
+            defaultValue: '',
+            description: 'Required at build time; Nginx HTTPS listening port')
+
+        string(name: 'DOMAIN',
+            defaultValue: '',
+            description: 'Required at build time; IP address or hostname covered by the SSL certificate. DNS is not required for local health checks.')
+
+        string(name: 'INSTANCE_COUNT',
+            defaultValue: '',
+            description: 'Required at build time; number of .NET instances (1-30)')
+
+        // Requires the Jenkins File Parameter plugin.
+        // Stashed File is Pipeline-compatible; do not use the built-in 'file' type.
+        stashedFile 'DEPLOYMENT_FILE'
+    }
+
+    environment {
+        REMOTE_HOST = 'root@20.20.40.36'
+        SSH_CREDENTIALS_ID = '20.20.40.36'
+
+        APP_USER = 'appuser'
+        APP_GROUP = 'www-data'
+
+        REMOTE_BASE = '/var/www'
+        LOG_BASE = '/var/log'
+
+        SSL_CERT = '/etc/nginx/ssl/fullchain.crt'
+        SSL_KEY = '/etc/nginx/ssl/1point1.key'
+
+        REPORT_FILE = 'deployment-report.csv'
+        PACKAGE_FILE = 'deployment.tar.gz'
+    }
+
+    stages {
+
+        // ==================================================
+        // 1. INITIALIZE CSV REPORT
+        // ==================================================
+
+        stage('Initialize Deployment Report') {
+            steps {
+                script {
+                    env.DEPLOYMENT_START_MILLIS = System.currentTimeMillis().toString()
+                    env.DEPLOYMENT_START = new Date().format(
+                        "yyyy-MM-dd HH:mm:ss",
+                        TimeZone.getTimeZone('Asia/Kolkata')
+                    )
+                }
+
+                sh '''#!/bin/bash
+                    set -eu
+
+                    mkdir -p deployment-logs
+
+                    cat > report-helper.sh <<'HELPER'
+#!/bin/bash
+
+csv_row() {
+    local output=""
+    local value
+
+    for value in "$@"; do
+        value="${value//\\"/\\"\\"}"
+        output="${output}\\"${value}\\","
+    done
+
+    printf '%s\\n' "${output%,}" >> "$REPORT_FILE"
+}
+
+csv_timestamp() {
+    date '+%Y-%m-%d %H:%M:%S %z'
+}
+HELPER
+
+                    chmod +x report-helper.sh
+
+                    cat > "$REPORT_FILE" <<'CSV'
+Timestamp,Build_Number,Site_Name,Domain,Port,Instance_Count,Instance,Activity,Status,Details
+CSV
+
+                    source report-helper.sh
+
+                    csv_row "$(csv_timestamp)" \
+                        "$BUILD_NUMBER" "$SITE_NAME" "$DOMAIN" \
+                        "$PORT" "$INSTANCE_COUNT" "ALL" \
+                        "Deployment Started" "INFO" \
+                        "Jenkins deployment initiated"
+
+                    echo "CSV deployment report initialized."
+                '''
+            }
+        }
+
+        // ==================================================
+        // 2. VALIDATE PARAMETERS
+        // ==================================================
+
+        stage('Validate Parameters') {
+            steps {
+                script {
+                    if (!params.SITE_NAME?.trim()) {
+                        error('SITE_NAME is required. Enter it when starting the build.')
+                    }
+                    if (!params.SITE_NAME.matches('[a-zA-Z0-9][a-zA-Z0-9_-]{0,49}')) {
+                        error('Invalid SITE_NAME')
+                    }
+
+                    if (!params.PORT?.trim()) {
+                        error('PORT is required. Enter it when starting the build.')
+                    }
+
+                    if (!params.INSTANCE_COUNT?.trim()) {
+                        error('INSTANCE_COUNT is required. Enter it when starting the build.')
+                    }
+
+                    if (!params.DOMAIN?.trim()) {
+                        error('DOMAIN is required. Enter an IP address or hostname when starting the build.')
+                    }
+
+                    if (params.DOMAIN != params.DOMAIN.trim()) {
+                        error('DOMAIN must not contain leading or trailing spaces')
+                    }
+
+                    def domainValue = params.DOMAIN
+                    def isIPv4 = domainValue ==~ /(?:[0-9]{1,3}\.){3}[0-9]{1,3}/
+
+                    if (isIPv4) {
+                        def ipOctets = domainValue.split('\\.').collect { it.toInteger() }
+                        if (ipOctets.any { it < 0 || it > 255 }) {
+                            error('Invalid IPv4 address in DOMAIN')
+                        }
+                    } else {
+                        def hostnameRegex = /(?i)^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)(?:\.(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?))*$/
+                        if (!(domainValue ==~ hostnameRegex)) {
+                            error('DOMAIN must be a valid IPv4 address or hostname (for example stage-uatcrm.1point1.in)')
+                        }
+                    }
+
+                    if (!params.PORT.matches('[0-9]{1,5}')) {
+                        error('Invalid PORT')
+                    }
+
+                    if (params.PORT.toInteger() < 1 ||
+                        params.PORT.toInteger() > 65535) {
+                        error('Invalid PORT range')
+                    }
+
+                    if (!params.INSTANCE_COUNT.matches('[0-9]{1,2}')) {
+                        error('Invalid INSTANCE_COUNT')
+                    }
+
+                    if (params.INSTANCE_COUNT.toInteger() < 1 ||
+                        params.INSTANCE_COUNT.toInteger() > 30) {
+                        error('INSTANCE_COUNT must be 1-30')
+                    }
+
+                    echo """
+                    SITE NAME      : ${params.SITE_NAME}
+                    DOMAIN         : ${params.DOMAIN}
+                    PORT           : ${params.PORT}
+                    INSTANCES      : ${params.INSTANCE_COUNT}
+                    REMOTE SERVER  : ${REMOTE_HOST}
+                    """
+                }
+
+                sh '''#!/bin/bash
+                    set -eu
+                    source report-helper.sh
+
+                    csv_row "$(csv_timestamp)" \
+                        "$BUILD_NUMBER" "$SITE_NAME" "$DOMAIN" \
+                        "$PORT" "$INSTANCE_COUNT" "ALL" \
+                        "Parameter Validation" "SUCCESS" \
+                        "All deployment parameters validated"
+
+                    for cmd in unzip tar sha256sum find awk; do
+                        command -v "$cmd" >/dev/null 2>&1 || {
+                            csv_row "$(csv_timestamp)" \
+                                "$BUILD_NUMBER" "$SITE_NAME" "$DOMAIN" \
+                                "$PORT" "$INSTANCE_COUNT" "ALL" \
+                                "Jenkins Tool Validation" "FAILURE" \
+                                "Missing tool: $cmd"
+                            exit 1
+                        }
+                    done
+
+                    csv_row "$(csv_timestamp)" \
+                        "$BUILD_NUMBER" "$SITE_NAME" "$DOMAIN" \
+                        "$PORT" "$INSTANCE_COUNT" "ALL" \
+                        "Jenkins Tool Validation" "SUCCESS" \
+                        "Required Jenkins tools available"
+                '''
+            }
+        }
+
+        // ==================================================
+        // 3. UPLOAD AND VALIDATE ZIP
+        // ==================================================
+
+        stage('Upload and Validate ZIP') {
+            steps {
+                script {
+                    if (!env.DEPLOYMENT_FILE_FILENAME?.trim()) {
+                        error('No ZIP file uploaded. Please select DEPLOYMENT_FILE.')
+                    }
+                    echo "Uploaded application file: ${env.DEPLOYMENT_FILE_FILENAME}"
+                }
+
+                // Stashed File parameters are retrieved with unstash.
+                // This avoids the withFileParameter wrapper that failed in earlier builds.
+                unstash 'DEPLOYMENT_FILE'
+
+                sh '''#!/bin/bash
+                    set -Eeuo pipefail
+
+                    source report-helper.sh
+
+                    UPLOADED_ZIP="$WORKSPACE/uploaded-source.zip"
+                    STASHED_FILE="$WORKSPACE/DEPLOYMENT_FILE"
+
+                    if [ ! -f "$STASHED_FILE" ]; then
+                        csv_row "$(csv_timestamp)" \
+                            "$BUILD_NUMBER" "$SITE_NAME" "$DOMAIN" \
+                            "$PORT" "$INSTANCE_COUNT" "ALL" \
+                            "ZIP Upload" "FAILURE" \
+                            "Stashed deployment file not found at $STASHED_FILE"
+                        echo "ERROR: Stashed deployment file not found."
+                        exit 1
+                    fi
+
+                    cp -- "$STASHED_FILE" "$UPLOADED_ZIP"
+
+                    ZIP_NAME="${DEPLOYMENT_FILE_FILENAME:-DEPLOYMENT_FILE}"
+
+                    csv_row "$(csv_timestamp)" \
+                        "$BUILD_NUMBER" "$SITE_NAME" "$DOMAIN" \
+                        "$PORT" "$INSTANCE_COUNT" "ALL" \
+                        "ZIP Upload" "SUCCESS" \
+                        "Uploaded file: $ZIP_NAME"
+
+                    echo "Uploaded ZIP: $ZIP_NAME"
+                    echo "Validating ZIP integrity..."
+
+                    if ! unzip -t "$UPLOADED_ZIP"; then
+                        csv_row "$(csv_timestamp)" \
+                            "$BUILD_NUMBER" "$SITE_NAME" "$DOMAIN" \
+                            "$PORT" "$INSTANCE_COUNT" "ALL" \
+                            "ZIP Validation" "FAILURE" \
+                            "ZIP integrity check failed"
+                        echo "ERROR: Invalid ZIP archive."
+                        exit 1
+                    fi
+
+                    csv_row "$(csv_timestamp)" \
+                        "$BUILD_NUMBER" "$SITE_NAME" "$DOMAIN" \
+                        "$PORT" "$INSTANCE_COUNT" "ALL" \
+                        "ZIP Validation" "SUCCESS" \
+                        "ZIP integrity verified"
+
+                    mkdir -p extracted application
+                    unzip -oq "$UPLOADED_ZIP" -d extracted
+
+                    DLL_PATH=$(find "$WORKSPACE/extracted" \
+                        -type f -name 'ServerCRM.dll' -print -quit)
+
+                    if [ -z "$DLL_PATH" ]; then
+                        csv_row "$(csv_timestamp)" \
+                            "$BUILD_NUMBER" "$SITE_NAME" "$DOMAIN" \
+                            "$PORT" "$INSTANCE_COUNT" "ALL" \
+                            "Application Validation" "FAILURE" \
+                            "ServerCRM.dll not found"
+                        echo "ERROR: ServerCRM.dll not found."
+                        exit 1
+                    fi
+
+                    APP_SOURCE=$(dirname "$DLL_PATH")
+
+                    for FILE in \
+                        ServerCRM.dll \
+                        ServerCRM.runtimeconfig.json \
+                        ServerCRM.deps.json \
+                        appsettings.json
+                    do
+                        if [ ! -f "$APP_SOURCE/$FILE" ]; then
+                            csv_row "$(csv_timestamp)" \
+                                "$BUILD_NUMBER" "$SITE_NAME" "$DOMAIN" \
+                                "$PORT" "$INSTANCE_COUNT" "ALL" \
+                                "Application Validation" "FAILURE" \
+                                "Missing required file: $FILE"
+                            echo "ERROR: Missing required file: $FILE"
+                            exit 1
+                        fi
+                    done
+
+                    cp -a "$APP_SOURCE/." application/
+
+                    DLL_SHA256=$(sha256sum application/ServerCRM.dll | awk '{print $1}')
+                    printf '%s\\n' "$DLL_SHA256" > dll.sha256
+
+                    csv_row "$(csv_timestamp)" \
+                        "$BUILD_NUMBER" "$SITE_NAME" "$DOMAIN" \
+                        "$PORT" "$INSTANCE_COUNT" "ALL" \
+                        "DLL SHA256" "SUCCESS" \
+                        "$DLL_SHA256"
+
+                    csv_row "$(csv_timestamp)" \
+                        "$BUILD_NUMBER" "$SITE_NAME" "$DOMAIN" \
+                        "$PORT" "$INSTANCE_COUNT" "ALL" \
+                        "Application Validation" "SUCCESS" \
+                        "Required .NET application files verified"
+
+                    echo "ZIP validation successful."
+                    echo "Application files validated."
+                    echo "DLL SHA256: $DLL_SHA256"
+                '''
+            }
+        }
+
+        stage('Create Deployment Package') {
+            steps {
+                sh '''#!/bin/bash
+                    set -Eeuo pipefail
+                    source report-helper.sh
+
+                    tar -czf "$PACKAGE_FILE" -C application .
+
+                    if tar -tzf "$PACKAGE_FILE" >/dev/null; then
+
+                        csv_row "$(csv_timestamp)" \
+                            "$BUILD_NUMBER" "$SITE_NAME" "$DOMAIN" \
+                            "$PORT" "$INSTANCE_COUNT" "ALL" \
+                            "TAR.GZ Creation" "SUCCESS" \
+                            "deployment.tar.gz created and validated"
+
+                    else
+
+                        csv_row "$(csv_timestamp)" \
+                            "$BUILD_NUMBER" "$SITE_NAME" "$DOMAIN" \
+                            "$PORT" "$INSTANCE_COUNT" "ALL" \
+                            "TAR.GZ Creation" "FAILURE" \
+                            "TAR integrity validation failed"
+
+                        exit 1
+
+                    fi
+
+                    PACKAGE_SHA256=$(sha256sum \
+                        "$PACKAGE_FILE" | awk '{print $1}')
+
+                    echo "$PACKAGE_SHA256" > package.sha256
+
+                    csv_row "$(csv_timestamp)" \
+                        "$BUILD_NUMBER" "$SITE_NAME" "$DOMAIN" \
+                        "$PORT" "$INSTANCE_COUNT" "ALL" \
+                        "Package SHA256" "SUCCESS" \
+                        "$PACKAGE_SHA256"
+
+                    echo "Package created successfully."
+                '''
+            }
+        }
+
+        // ==================================================
+        // 5. PREPARE REMOTE DEPLOYMENT SCRIPT
+        // ==================================================
+
+        stage('Prepare Remote Deployment Script') {
+            steps {
+                script {
+
+                    def remoteScript = '''#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+# ==========================================================
+# VARIABLES
+# ==========================================================
+
+SITE_NAME="${SITE_NAME:?}"
+DOMAIN="${DOMAIN:?}"
+PORT="${PORT:?}"
+INSTANCE_COUNT="${INSTANCE_COUNT:?}"
+BUILD_NUMBER="${BUILD_NUMBER:?}"
+
+EXPECTED_SHA256="${EXPECTED_SHA256:?}"
+EXPECTED_DLL_SHA256="${EXPECTED_DLL_SHA256:?}"
+
+REMOTE_TMP="/tmp/crm-deploy-${SITE_NAME}-${BUILD_NUMBER}"
+PACKAGE="/tmp/deployment-${SITE_NAME}-${BUILD_NUMBER}.tar.gz"
+REPORT_FILE="/tmp/${SITE_NAME}-deployment-report-${BUILD_NUMBER}.csv"
+
+NGINX_CONF="/etc/nginx/sites-enabled/${SITE_NAME}"
+
+REMOTE_BASE="/var/www"
+LOG_BASE="/var/log"
+SITE_LOG="${LOG_BASE}/${SITE_NAME}"
+
+APP_USER="appuser"
+APP_GROUP="www-data"
+
+SSL_CERT="/etc/nginx/ssl/fullchain.crt"
+SSL_KEY="/etc/nginx/ssl/1point1.key"
+
+CREATED=0
+HEALTH_OK=0
+ROLLBACK_STATUS="NOT_REQUIRED"
+
+declare -a SERVICES=()
+
+# ==========================================================
+# CSV REPORT FUNCTIONS
+# ==========================================================
+
+csv_row() {
+
+    local output=""
+    local value
+
+    for value in "$@"; do
+        value="${value//\\"/\\"\\"}"
+        output="${output}\\"${value}\\","
+    done
+
+    printf '%s\\n' "${output%,}" >> "$REPORT_FILE"
+}
+
+log_event() {
+
+    csv_row "$(date '+%Y-%m-%d %H:%M:%S %z')" \
+        "$BUILD_NUMBER" "$SITE_NAME" "$DOMAIN" \
+        "$PORT" "$INSTANCE_COUNT" "$1" "$2" "$3" "$4"
+
+    echo "[$3] $1 - $2 : $4"
+}
+
+# ==========================================================
+# REPORT HEADER
+# ==========================================================
+
+cat > "$REPORT_FILE" <<'CSV'
+Timestamp,Build_Number,Site_Name,Domain,Port,Instance_Count,Instance,Activity,Status,Details
+CSV
+
+log_event "ALL" "Remote Deployment Started" "INFO" \
+    "Remote deployment initiated"
+
+# ==========================================================
+# INSTANCE GENERATION
+# ==========================================================
+
+for ((i=1; i<=INSTANCE_COUNT; i++)); do
+
+    if [ "$i" -eq 1 ]; then
+        SERVICE="$SITE_NAME"
+    else
+        SERVICE="${SITE_NAME}-${i}"
+    fi
+
+    SERVICES+=("$SERVICE")
+
+done
+
+# ==========================================================
+# CLEANUP AND ROLLBACK
+# ==========================================================
+
+cleanup() {
+
+    RC=$?
+
+    trap - EXIT
+
+    if [ "$RC" -ne 0 ] && [ "$CREATED" -eq 1 ]; then
+
+        log_event "ALL" "Rollback" "STARTED" \
+            "Removing resources created by failed deployment"
+
+        ROLLBACK_OK=1
+
+        for SERVICE in "${SERVICES[@]}"; do
+
+            systemctl stop "$SERVICE" 2>/dev/null || true
+
+            systemctl disable "$SERVICE" 2>/dev/null || true
+
+            if ! rm -f \
+                "/etc/systemd/system/${SERVICE}.service"; then
+                ROLLBACK_OK=0
+            fi
+
+            if ! rm -rf \
+                "${REMOTE_BASE}/${SERVICE}" \
+                "${SITE_LOG}/${SERVICE}"; then
+                ROLLBACK_OK=0
+            fi
+
+            rm -rf "/run/${SERVICE}"
+
+            log_event "$SERVICE" "Rollback Cleanup" \
+                "$([ "$ROLLBACK_OK" -eq 1 ] && echo SUCCESS || echo FAILURE)" \
+                "Removed newly created service and application resources"
+
+        done
+
+        rm -f "$NGINX_CONF"
+
+        systemctl daemon-reload || ROLLBACK_OK=0
+
+        if nginx -t && systemctl reload nginx; then
+            log_event "ALL" "Nginx Rollback" "SUCCESS" \
+                "Original Nginx configuration restored"
+        else
+            ROLLBACK_OK=0
+            log_event "ALL" "Nginx Rollback" "FAILURE" \
+                "Nginx validation or reload failed"
+        fi
+
+        if [ "$ROLLBACK_OK" -eq 1 ]; then
+            ROLLBACK_STATUS="SUCCESS"
+        else
+            ROLLBACK_STATUS="PARTIAL_FAILURE"
+        fi
+
+        log_event "ALL" "Rollback" "$ROLLBACK_STATUS" \
+            "Rollback operation completed"
+
+    fi
+
+    if rm -rf "$REMOTE_TMP" && rm -f "$PACKAGE"; then
+
+        log_event "ALL" "Remote Temporary Cleanup" "SUCCESS" \
+            "Remote extraction directory and package removed"
+
+    else
+
+        log_event "ALL" "Remote Temporary Cleanup" "FAILURE" \
+            "Unable to remove all temporary files"
+
+        RC=1
+
+    fi
+
+    if [ "$RC" -eq 0 ]; then
+
+        log_event "ALL" "Final Deployment Status" "SUCCESS" \
+            "All deployment operations completed"
+
+    else
+
+        log_event "ALL" "Final Deployment Status" "FAILURE" \
+            "Deployment failed. Rollback: $ROLLBACK_STATUS"
+
+    fi
+
+    exit "$RC"
+}
+
+trap cleanup EXIT
+
+# ==========================================================
+# PREFLIGHT CHECKS
+# ==========================================================
+
+for CMD in tar sha256sum systemctl nginx curl dotnet ss openssl; do
+
+    if ! command -v "$CMD" >/dev/null 2>&1; then
+
+        log_event "ALL" "Preflight Validation" "FAILURE" \
+            "Required command missing: $CMD"
+
+        exit 1
+
+    fi
+
+done
+
+log_event "ALL" "Preflight Validation" "SUCCESS" \
+    "Required remote commands available"
+
+if ! id "$APP_USER" >/dev/null 2>&1; then
+    log_event "ALL" "User Validation" "FAILURE" \
+        "Application user missing"
+    exit 1
+fi
+
+if ! getent group "$APP_GROUP" >/dev/null; then
+    log_event "ALL" "Group Validation" "FAILURE" \
+        "Application group missing"
+    exit 1
+fi
+
+if [ ! -f "$SSL_CERT" ] || [ ! -f "$SSL_KEY" ]; then
+    log_event "ALL" "SSL Validation" "FAILURE" \
+        "SSL certificate or key missing"
+    exit 1
+fi
+
+# Validate the certificate against the supplied IP or hostname.
+# A wildcard certificate such as *.1point1.in can cover a matching hostname,
+# but it cannot validate a literal IPv4 address unless that IP is in an IP SAN.
+if [[ "$DOMAIN" =~ ^([0-9]{1,3}[.]){3}[0-9]{1,3}$ ]]; then
+    if ! openssl x509 -in "$SSL_CERT" -noout -checkip "$DOMAIN" >/dev/null 2>&1; then
+        log_event "ALL" "SSL IP SAN Validation" "FAILURE" \
+            "Certificate does not contain IP SAN $DOMAIN; use a hostname covered by the certificate or install an IP-SAN certificate"
+        exit 1
+    fi
+    log_event "ALL" "SSL IP SAN Validation" "SUCCESS" \
+        "Certificate contains IP SAN $DOMAIN"
+else
+    if ! openssl x509 -in "$SSL_CERT" -noout -checkhost "$DOMAIN" >/dev/null 2>&1; then
+        log_event "ALL" "SSL Hostname Validation" "FAILURE" \
+            "Certificate does not cover hostname $DOMAIN"
+        exit 1
+    fi
+    log_event "ALL" "SSL Hostname Validation" "SUCCESS" \
+        "Certificate covers hostname $DOMAIN"
+fi
+
+if [ ! -f "$PACKAGE" ]; then
+    log_event "ALL" "Package Validation" "FAILURE" \
+        "Remote package not found"
+    exit 1
+fi
+
+log_event "ALL" "SSL Validation" "SUCCESS" \
+    "SSL certificate and key found"
+
+# ==========================================================
+# CHECK EXISTING RESOURCES
+# ==========================================================
+
+if [ -e "$NGINX_CONF" ]; then
+
+    log_event "ALL" "Existing Resource Check" "FAILURE" \
+        "Nginx configuration already exists"
+
+    exit 1
+
+fi
+
+for SERVICE in "${SERVICES[@]}"; do
+
+    if [ -e "/etc/systemd/system/${SERVICE}.service" ] ||
+       [ -e "${REMOTE_BASE}/${SERVICE}" ] ||
+       [ -e "${SITE_LOG}/${SERVICE}" ]; then
+
+        log_event "$SERVICE" "Existing Resource Check" "FAILURE" \
+            "Existing application resource found"
+
+        exit 1
+
+    fi
+
+done
+
+if ss -ltnH "sport = :${PORT}" | grep -q .; then
+
+    log_event "ALL" "Port Availability" "FAILURE" \
+        "Requested port already in use"
+
+    exit 1
+
+fi
+
+log_event "ALL" "Existing Resource Check" "SUCCESS" \
+    "No conflicting application resources or listening port"
+
+# ==========================================================
+# VERIFY PACKAGE SHA256
+# ==========================================================
+
+ACTUAL_SHA256=$(sha256sum "$PACKAGE" | awk '{print $1}')
+
+if [ "$ACTUAL_SHA256" != "$EXPECTED_SHA256" ]; then
+
+    log_event "ALL" "Package SHA256" "FAILURE" \
+        "Remote package checksum mismatch"
+
+    exit 1
+
+fi
+
+log_event "ALL" "Package SHA256" "SUCCESS" \
+    "$ACTUAL_SHA256"
+
+if ! tar -tzf "$PACKAGE" >/dev/null; then
+
+    log_event "ALL" "TAR Integrity" "FAILURE" \
+        "Remote TAR integrity check failed"
+
+    exit 1
+
+fi
+
+log_event "ALL" "TAR Integrity" "SUCCESS" \
+    "Remote TAR integrity verified"
+
+# ==========================================================
+# EXTRACT EACH INSTANCE SEPARATELY
+# ==========================================================
+
+mkdir -p "$REMOTE_TMP"
+
+for SERVICE in "${SERVICES[@]}"; do
+
+    mkdir -p "$REMOTE_TMP/$SERVICE"
+
+    if ! tar -xzf "$PACKAGE" -C "$REMOTE_TMP/$SERVICE"; then
+
+        log_event "$SERVICE" "Package Extraction" "FAILURE" \
+            "Unable to extract application package"
+
+        exit 1
+
+    fi
+
+    for FILE in \
+        ServerCRM.dll \
+        ServerCRM.runtimeconfig.json \
+        ServerCRM.deps.json \
+        appsettings.json
+    do
+
+        if [ ! -f "$REMOTE_TMP/$SERVICE/$FILE" ]; then
+
+            log_event "$SERVICE" "Application Validation" "FAILURE" \
+                "Missing required file: $FILE"
+
+            exit 1
+
+        fi
+
+    done
+
+    DLL_HASH=$(sha256sum \
+        "$REMOTE_TMP/$SERVICE/ServerCRM.dll" | awk '{print $1}')
+
+    if [ "$DLL_HASH" != "$EXPECTED_DLL_SHA256" ]; then
+
+        log_event "$SERVICE" "DLL SHA256" "FAILURE" \
+            "DLL checksum mismatch"
+
+        exit 1
+
+    fi
+
+    log_event "$SERVICE" "Package Extraction" "SUCCESS" \
+        "Package extracted and DLL SHA256 verified"
+
+done
+
+# ==========================================================
+# BEGIN TRACKING NEW RESOURCES
+# ==========================================================
+
+CREATED=1
+
+# ==========================================================
+# CREATE APPLICATION AND LOG DIRECTORIES
+# ==========================================================
+
+for SERVICE in "${SERVICES[@]}"; do
+
+    APP_DIR="${REMOTE_BASE}/${SERVICE}"
+    INSTANCE_LOG="${SITE_LOG}/${SERVICE}"
+
+    if mkdir -p "$APP_DIR" "$INSTANCE_LOG"; then
+
+        log_event "$SERVICE" "Directory Creation" "SUCCESS" \
+            "$APP_DIR and $INSTANCE_LOG"
+
+    else
+
+        log_event "$SERVICE" "Directory Creation" "FAILURE" \
+            "Unable to create application/log directories"
+
+        exit 1
+
+    fi
+
+    if ! cp -a "$REMOTE_TMP/$SERVICE/." "$APP_DIR/"; then
+
+        log_event "$SERVICE" "Application Copy" "FAILURE" \
+            "Unable to copy application files"
+
+        exit 1
+
+    fi
+
+    if ! chown -R "${APP_USER}:${APP_GROUP}" "$APP_DIR" "$INSTANCE_LOG"; then
+
+        log_event "$SERVICE" "Ownership Configuration" "FAILURE" \
+            "Unable to set application ownership"
+
+        exit 1
+
+    fi
+
+    find "$APP_DIR" -type d -exec chmod 0755 {} +
+    find "$APP_DIR" -type f -exec chmod 0644 {} +
+
+    log_event "$SERVICE" "Application Copy" "SUCCESS" \
+        "Application files copied and permissions configured"
+
+done
+
+mkdir -p "${SITE_LOG}/nginx"
+
+chown "${APP_USER}:${APP_GROUP}" "${SITE_LOG}/nginx"
+
+log_event "ALL" "Nginx Log Directory" "SUCCESS" \
+    "${SITE_LOG}/nginx"
+
+# ==========================================================
+# GENERATE SYSTEMD SERVICE FILES
+# ==========================================================
+
+for SERVICE in "${SERVICES[@]}"; do
+
+    UNIT_FILE="/etc/systemd/system/${SERVICE}.service"
+
+    cat > "$UNIT_FILE" <<EOF
+[Unit]
+Description=${SERVICE} ASP.NET Core Application
+After=network.target
+
+[Service]
+User=${APP_USER}
+Group=${APP_GROUP}
+
+WorkingDirectory=${REMOTE_BASE}/${SERVICE}
+
+Environment=ASPNETCORE_ENVIRONMENT=Production
+Environment=DOTNET_PRINT_TELEMETRY_MESSAGE=false
+Environment=DOTNET_gcServer=1
+Environment=DOTNET_GCHeapHardLimitPercent=75
+Environment=DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=false
+Environment=OPENSSL_CONF=/etc/ssl/openssl.cnf
+
+Environment=ASPNETCORE_URLS=http://unix:/run/${SERVICE}/${SERVICE}.sock
+
+RuntimeDirectory=${SERVICE}
+RuntimeDirectoryMode=0775
+
+ExecStart=/usr/bin/dotnet ${REMOTE_BASE}/${SERVICE}/ServerCRM.dll
+
+Restart=always
+RestartSec=5
+KillSignal=SIGINT
+SyslogIdentifier=${SERVICE}
+
+LimitNOFILE=65535
+LimitNPROC=65535
+TasksMax=infinity
+
+UMask=0002
+
+StandardOutput=append:${SITE_LOG}/${SERVICE}/dotnet-access.log
+StandardError=append:${SITE_LOG}/${SERVICE}/dotnet-error.log
+
+PrivateTmp=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    if [ -s "$UNIT_FILE" ]; then
+
+        chmod 0644 "$UNIT_FILE"
+
+        log_event "$SERVICE" "Systemd Configuration" "SUCCESS" \
+            "$UNIT_FILE"
+
+    else
+
+        log_event "$SERVICE" "Systemd Configuration" "FAILURE" \
+            "Unable to create service unit"
+
+        exit 1
+
+    fi
+
+done
+
+# ==========================================================
+# GENERATE ONE NGINX CONFIGURATION
+# ==========================================================
+
+cat > "$NGINX_CONF" <<EOF
+# Automatically generated for ${SITE_NAME}
+
+upstream ${SITE_NAME}_backend {
+
+    ip_hash;
+
+EOF
+
+for SERVICE in "${SERVICES[@]}"; do
+
+    cat >> "$NGINX_CONF" <<EOF
+    server unix:/run/${SERVICE}/${SERVICE}.sock max_fails=1 fail_timeout=10s;
+
+EOF
+
+done
+
+cat >> "$NGINX_CONF" <<EOF
+}
+
+server {
+
+    listen ${PORT} ssl http2;
+
+    server_name ${DOMAIN};
+
+    ssl_certificate ${SSL_CERT};
+    ssl_certificate_key ${SSL_KEY};
+
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers HIGH:!aNULL:!MD5;
+
+    client_max_body_size 100M;
+
+    proxy_connect_timeout 300s;
+    proxy_send_timeout 300s;
+    proxy_read_timeout 300s;
+    send_timeout 300s;
+
+    access_log ${SITE_LOG}/nginx/access.log combined;
+    error_log ${SITE_LOG}/nginx/nginx-error.log;
+
+    location /static/ {
+
+        alias ${REMOTE_BASE}/${SITE_NAME}/wwwroot/;
+
+        expires 30d;
+        access_log off;
+    }
+
+    location / {
+
+        proxy_pass http://${SITE_NAME}_backend;
+
+        proxy_http_version 1.1;
+
+        proxy_set_header Host \\$host;
+        proxy_set_header X-Real-IP \\$remote_addr;
+        proxy_set_header X-Forwarded-For \\$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+
+        proxy_set_header Upgrade \\$http_upgrade;
+        proxy_set_header Connection "upgrade";
+
+        proxy_buffering off;
+    }
+}
+EOF
+
+chmod 0644 "$NGINX_CONF"
+
+log_event "ALL" "Nginx Configuration Creation" "SUCCESS" \
+    "$NGINX_CONF"
+
+# ==========================================================
+# VALIDATE NGINX
+# ==========================================================
+
+if nginx -t; then
+
+    log_event "ALL" "Nginx Configuration Validation" "SUCCESS" \
+        "nginx -t passed"
+
+else
+
+    log_event "ALL" "Nginx Configuration Validation" "FAILURE" \
+        "nginx -t failed"
+
+    exit 1
+
+fi
+
+# ==========================================================
+# SYSTEMD RELOAD
+# ==========================================================
+
+if systemctl daemon-reload; then
+
+    log_event "ALL" "Systemd Daemon Reload" "SUCCESS" \
+        "Systemd configuration reloaded"
+
+else
+
+    log_event "ALL" "Systemd Daemon Reload" "FAILURE" \
+        "systemctl daemon-reload failed"
+
+    exit 1
+
+fi
+
+# ==========================================================
+# ENABLE AND START EACH INSTANCE
+# ==========================================================
+
+for SERVICE in "${SERVICES[@]}"; do
+
+    if systemctl enable "$SERVICE" &&
+       systemctl start "$SERVICE"; then
+
+        log_event "$SERVICE" "Service Startup" "SUCCESS" \
+            "Service enabled and start requested"
+
+    else
+
+        log_event "$SERVICE" "Service Startup" "FAILURE" \
+            "Unable to enable or start service"
+
+        journalctl -u "$SERVICE" -n 30 --no-pager || true
+
+        exit 1
+
+    fi
+
+    if systemctl is-active --quiet "$SERVICE"; then
+
+        log_event "$SERVICE" "Service Status" "SUCCESS" \
+            "systemd reports active"
+
+    else
+
+        log_event "$SERVICE" "Service Status" "FAILURE" \
+            "Service is not active"
+
+        exit 1
+
+    fi
+
+    SOCKET="/run/${SERVICE}/${SERVICE}.sock"
+    SOCKET_OK=0
+
+    for ((attempt=1; attempt<=20; attempt++)); do
+
+        if [ -S "$SOCKET" ]; then
+            SOCKET_OK=1
+            break
+        fi
+
+        sleep 2
+
+    done
+
+    if [ "$SOCKET_OK" -eq 1 ]; then
+
+        log_event "$SERVICE" "Socket Verification" "SUCCESS" \
+            "$SOCKET"
+
+    else
+
+        log_event "$SERVICE" "Socket Verification" "FAILURE" \
+            "Socket not created: $SOCKET"
+
+        journalctl -u "$SERVICE" -n 50 --no-pager || true
+
+        exit 1
+
+    fi
+
+done
+
+# ==========================================================
+# RELOAD NGINX
+# ==========================================================
+
+if systemctl reload nginx; then
+
+    log_event "ALL" "Nginx Reload" "SUCCESS" \
+        "Nginx reloaded with new application configuration"
+
+else
+
+    log_event "ALL" "Nginx Reload" "FAILURE" \
+        "Nginx reload failed"
+
+    exit 1
+
+fi
+
+# ==========================================================
+# HTTPS HEALTH CHECK
+# ==========================================================
+
+HEALTH_URL="https://${DOMAIN}:${PORT}/"
+
+HTTP_CODE="000"
+HEALTH_OK=0
+CURL_ERROR=""
+CURL_ERROR_FILE="/tmp/healthcheck-curl-error-${BUILD_NUMBER}.txt"
+
+log_event "ALL" "HTTPS Health Check" "INFO" \
+    "Starting IP-based HTTPS health check: $HEALTH_URL"
+
+for ((attempt=1; attempt<=12; attempt++)); do
+
+    HTTP_CODE="000"
+    CURL_ERROR=""
+
+    HTTP_CODE=$(curl \
+        --silent \
+        --show-error \
+        --output /dev/null \
+        --write-out '%{http_code}' \
+        --connect-timeout 10 \
+        --max-time 30 \
+        --connect-to "${DOMAIN}:${PORT}:127.0.0.1:${PORT}" \
+        "$HEALTH_URL" \
+        2>"$CURL_ERROR_FILE" || true)
+
+    CURL_ERROR=$(cat "$CURL_ERROR_FILE" 2>/dev/null || true)
+
+    if [[ "$HTTP_CODE" =~ ^[23][0-9][0-9]$ ]]; then
+
+        HEALTH_OK=1
+
+        log_event "ALL" "HTTPS Health Check" "SUCCESS" \
+            "IP URL: $HEALTH_URL; HTTP: $HTTP_CODE; TLS verification enabled"
+
+        break
+
+    fi
+
+    log_event "ALL" "HTTPS Health Check Attempt ${attempt}" "WARNING" \
+        "Attempt: ${attempt}/12; HTTP: ${HTTP_CODE}; Error: ${CURL_ERROR:-none}"
+
+    sleep 5
+
+done
+
+rm -f "$CURL_ERROR_FILE"
+
+if [ "$HEALTH_OK" -ne 1 ]; then
+
+    log_event "ALL" "HTTPS Health Check" "FAILURE" \
+        "IP-based HTTPS health check failed; HTTP: ${HTTP_CODE}; Error: ${CURL_ERROR:-none}"
+
+    exit 1
+
+fi
+# ==========================================================
+# FINAL SERVICE INFORMATION
+# ==========================================================
+
+for SERVICE in "${SERVICES[@]}"; do
+
+    log_event "$SERVICE" "Final Service Verification" "SUCCESS" \
+        "Service active and Unix socket verified"
+
+done
+
+log_event "ALL" "Deployment Completed" "SUCCESS" \
+    "Application hosting successfully configured"
+
+echo "Remote deployment completed."
+'''
+
+                    writeFile(
+                        file: 'remote-deploy.sh',
+                        text: remoteScript
+                    )
+
+                    sh 'chmod 700 remote-deploy.sh'
+                }
+            }
+        }
+
+        // ==================================================
+        // 6. TRANSFER AND DEPLOY
+        // ==================================================
+
+        stage('Transfer and Deploy') {
+            steps {
+
+                script {
+
+                    env.EXPECTED_SHA256 = readFile(
+                        'package.sha256'
+                    ).trim()
+
+                    env.EXPECTED_DLL_SHA256 = readFile(
+                        'dll.sha256'
+                    ).trim()
+
+                    if (!env.EXPECTED_SHA256 ||
+                        !env.EXPECTED_DLL_SHA256) {
+                        error('Package checksum missing')
+                    }
+                }
+
+                sshagent(credentials: [SSH_CREDENTIALS_ID]) {
+
+                    script {
+
+                        int remoteRC = 0
+
+                        try {
+
+                            sh '''#!/bin/bash
+                                set -Eeuo pipefail
+                                source report-helper.sh
+
+                                REMOTE_PACKAGE="/tmp/deployment-${SITE_NAME}-${BUILD_NUMBER}.tar.gz"
+                                REMOTE_SCRIPT="/tmp/deploy-${SITE_NAME}-${BUILD_NUMBER}.sh"
+                                REMOTE_REPORT="/tmp/${SITE_NAME}-deployment-report-${BUILD_NUMBER}.csv"
+
+                                scp -o BatchMode=yes \
+                                    "$PACKAGE_FILE" \
+                                    "${REMOTE_HOST}:${REMOTE_PACKAGE}"
+
+                                csv_row "$(csv_timestamp)" \
+                                    "$BUILD_NUMBER" "$SITE_NAME" "$DOMAIN" \
+                                    "$PORT" "$INSTANCE_COUNT" "ALL" \
+                                    "SCP Package Transfer" "SUCCESS" \
+                                    "Package transferred to remote server"
+
+                                scp -o BatchMode=yes \
+                                    remote-deploy.sh \
+                                    "${REMOTE_HOST}:${REMOTE_SCRIPT}"
+
+                                csv_row "$(csv_timestamp)" \
+                                    "$BUILD_NUMBER" "$SITE_NAME" "$DOMAIN" \
+                                    "$PORT" "$INSTANCE_COUNT" "ALL" \
+                                    "SCP Script Transfer" "SUCCESS" \
+                                    "Remote deployment script transferred"
+                            '''
+
+                        } catch (e) {
+
+                            remoteRC = 1
+
+                            sh '''#!/bin/bash
+                                source report-helper.sh
+
+                                csv_row "$(csv_timestamp)" \
+                                    "$BUILD_NUMBER" "$SITE_NAME" "$DOMAIN" \
+                                    "$PORT" "$INSTANCE_COUNT" "ALL" \
+                                    "SCP Transfer" "FAILURE" \
+                                    "Package or deployment script transfer failed"
+                            '''
+
+                        }
+
+                        if (remoteRC == 0) {
+
+                            try {
+
+                                sh '''#!/bin/bash
+                                    set -Eeuo pipefail
+
+                                    ssh -o BatchMode=yes "$REMOTE_HOST" \
+                                      "SITE_NAME='$SITE_NAME' \
+                                      DOMAIN='$DOMAIN' \
+                                      PORT='$PORT' \
+                                      INSTANCE_COUNT='$INSTANCE_COUNT' \
+                                      BUILD_NUMBER='$BUILD_NUMBER' \
+                                      EXPECTED_SHA256='$EXPECTED_SHA256' \
+                                      EXPECTED_DLL_SHA256='$EXPECTED_DLL_SHA256' \
+                                      bash '/tmp/deploy-${SITE_NAME}-${BUILD_NUMBER}.sh'"
+                                '''
+
+                            } catch (e) {
+
+                                remoteRC = 1
+
+                                echo "Remote deployment returned failure. Retrieving report."
+                            }
+                        }
+
+                        // Always attempt to retrieve remote CSV.
+                        try {
+
+                            sh '''#!/bin/bash
+                                scp -o BatchMode=yes \
+                                    "${REMOTE_HOST}:/tmp/${SITE_NAME}-deployment-report-${BUILD_NUMBER}.csv" \
+                                    remote-deployment-report.csv
+                            '''
+
+                            if (fileExists('remote-deployment-report.csv')) {
+
+                                sh '''#!/bin/bash
+                                    source report-helper.sh
+
+                                    if [ -s remote-deployment-report.csv ]; then
+                                        tail -n +2 remote-deployment-report.csv \
+                                            >> "$REPORT_FILE"
+                                    fi
+                                '''
+                            }
+
+                        } catch (e) {
+
+                            sh '''#!/bin/bash
+                                source report-helper.sh
+
+                                csv_row "$(csv_timestamp)" \
+                                    "$BUILD_NUMBER" "$SITE_NAME" "$DOMAIN" \
+                                    "$PORT" "$INSTANCE_COUNT" "ALL" \
+                                    "Remote Report Retrieval" "FAILURE" \
+                                    "Unable to retrieve remote CSV report"
+                            '''
+                        }
+
+                        if (remoteRC != 0) {
+                            error('Deployment failed. Check the CSV report and Jenkins console.')
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ======================================================
+    // POST BUILD: FINAL CSV GENERATION AND ARCHIVING
+    // ======================================================
+
+    post {
+
+        success {
+
+            script {
+
+                env.FINAL_STATUS = 'SUCCESS'
+
+                echo 'Hosting deployment completed successfully.'
+            }
+        }
+
+        failure {
+
+            script {
+
+                env.FINAL_STATUS = 'FAILURE'
+
+                echo 'Hosting deployment failed. Review CSV report.'
+            }
+        }
+
+        aborted {
+
+            script {
+
+                env.FINAL_STATUS = 'ABORTED'
+            }
+        }
+
+        always {
+            script {
+                def finishTime = new Date().format(
+                    "yyyy-MM-dd HH:mm:ss",
+                    TimeZone.getTimeZone('Asia/Kolkata')
+                )
+
+                def startMillis = (env.DEPLOYMENT_START_MILLIS ?: '').trim()
+                long durationSeconds = 0L
+                if (startMillis.matches('[0-9]+')) {
+                    durationSeconds = Math.max(
+                        0L,
+                        (long)((System.currentTimeMillis() - startMillis.toLong()) / 1000L)
+                    )
+                }
+
+                def finalStatus = currentBuild.currentResult ?: (env.FINAL_STATUS ?: 'FAILURE')
+                def csvEscape = { value ->
+                    '"' + (value == null ? '' : value.toString().replace('"', '""')) + '"'
+                }
+
+                if (!fileExists(env.REPORT_FILE)) {
+                    writeFile(
+                        file: env.REPORT_FILE,
+                        text: 'Timestamp,Build_Number,Site_Name,Domain,Port,Instance_Count,Instance,Activity,Status,Details\n'
+                    )
+                }
+
+                def report = readFile(env.REPORT_FILE)
+                def finalRow = [
+                    finishTime,
+                    env.BUILD_NUMBER,
+                    params.SITE_NAME,
+                    params.DOMAIN,
+                    params.PORT,
+                    params.INSTANCE_COUNT,
+                    'ALL',
+                    'FINAL DEPLOYMENT SUMMARY',
+                    finalStatus,
+                    "Finished: ${finishTime}; Duration: ${durationSeconds} seconds; HTTPS URL: https://${params.DOMAIN}:${params.PORT}/"
+                ].collect(csvEscape).join(',')
+
+                writeFile(
+                    file: env.REPORT_FILE,
+                    text: report + finalRow + '\n'
+                )
+
+                def artifactName =
+                    "${params.SITE_NAME}-deployment-report-build-${env.BUILD_NUMBER}.csv"
+
+                sh "cp '${env.REPORT_FILE}' '${artifactName}'"
+
+                archiveArtifacts(
+                    artifacts: artifactName,
+                    allowEmptyArchive: false,
+                    fingerprint: true
+                )
+
+                // ==========================================
+                // SEND HTML DEPLOYMENT EMAIL NOTIFICATION
+                // ==========================================
+
+                try {
+                    def emailSubject =
+                        "[${finalStatus}] ${params.SITE_NAME} - Build #${env.BUILD_NUMBER}"
+
+                    def emailBody = """
+<html>
+<body style="font-family:Arial,sans-serif;font-size:14px;color:#333;">
+
+    <h2>Jenkins Deployment Notification</h2>
+
+    <p><b>Job Name:</b> ${env.JOB_NAME}</p>
+    <p><b>Build Number:</b> #${env.BUILD_NUMBER}</p>
+    <p><b>Build Status:</b> ${finalStatus}</p>
+    <p><b>Build URL:</b>
+       <a href="${env.BUILD_URL}">${env.BUILD_URL}</a>
+    </p>
+    <p><b>Build Duration:</b> ${durationSeconds} seconds</p>
+
+    <hr>
+
+    <h3>Deployment Details</h3>
+    <p><b>Application / Site Name:</b> ${params.SITE_NAME}</p>
+    <p><b>Server IP / Domain:</b> ${params.DOMAIN}</p>
+    <p><b>Application URL:</b>
+       <a href="https://${params.DOMAIN}:${params.PORT}/">https://${params.DOMAIN}:${params.PORT}/</a>
+    </p>
+    <p><b>HTTPS Port:</b> ${params.PORT}</p>
+    <p><b>Instance Count:</b> ${params.INSTANCE_COUNT}</p>
+    <p><b>Start Time:</b> ${env.DEPLOYMENT_START ?: 'Not available'}</p>
+    <p><b>Finish Time:</b> ${finishTime}</p>
+
+    <hr>
+
+    <h3>Deployment Report</h3>
+    <p><b>CSV Report:</b>
+       <a href="${env.BUILD_URL}artifact/${artifactName}">View Deployment CSV Report</a>
+    </p>
+
+    <p>The deployment CSV report is also attached to this email.
+       It contains detailed deployment activities, validation results,
+       service status, health checks, and rollback information.</p>
+
+    <p>Console output and all archived artifacts are available on the
+       <a href="${env.BUILD_URL}">Jenkins build page</a>.</p>
+
+    <p>Regards,<br>Jenkins Automation</p>
+
+</body>
+</html>
+"""
+
+                    emailext(
+    to: 'sonu.kumar@1point1.com',
+    subject: emailSubject,
+    body: emailBody,
+    mimeType: 'text/html',
+    attachmentsPattern: artifactName,
+    attachLog: true
+)
+                    echo 'HTML deployment email notification submitted.'
+
+                } catch (mailError) {
+                    echo "WARNING: Email notification failed: ${mailError}"
+                }
+
+                // ==========================================
+                // FINAL DEPLOYMENT CONSOLE SUMMARY
+                // ==========================================
+
+                echo """
+                ==========================================
+                FINAL DEPLOYMENT REPORT
+                ==========================================
+                Application : ${params.SITE_NAME}
+                Server IP   : ${params.DOMAIN}
+                HTTPS URL   : https://${params.DOMAIN}:${params.PORT}/
+                Port        : ${params.PORT}
+                Instances   : ${params.INSTANCE_COUNT}
+                Status      : ${finalStatus}
+                Duration    : ${durationSeconds} seconds
+
+                CSV ARTIFACT:
+                ${artifactName}
+                ==========================================
+                """
+            }
+        }
+    }
+}
